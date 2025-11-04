@@ -57,12 +57,8 @@ fn lookup_user(username: &str) -> Option<&'static User> {
     USERS.get(username)
 }
 
-pub fn parse_proxy_auth(req: &Request<Body>) -> Option<ClientConfig> {
-    println!("[dbg] parse_proxy_auth called");
-
-    // First, prefer Proxy-Authorization header (standard for HTTP proxies).
-    // If missing, fall back to URI userinfo (username:password@host).
-    let (username, password) = if let Some(header_val) = req.headers().get("Proxy-Authorization") {
+fn extract_credentials_from_header(req: &Request<Body>) -> Option<(String, String)> {
+    if let Some(header_val) = req.headers().get("Proxy-Authorization") {
         let header_str = match header_val.to_str() {
             Ok(s) => s,
             Err(_) => {
@@ -113,8 +109,13 @@ pub fn parse_proxy_auth(req: &Request<Body>) -> Option<ClientConfig> {
             u,
             p.len()
         );
-        (u.to_string(), p.to_string())
-    } else if let Some(authority) = req.uri().authority() {
+        return Some((u.to_string(), p.to_string()));
+    }
+    None
+}
+
+fn extract_credentials_from_uri(req: &Request<Body>) -> Option<(String, String)> {
+    if let Some(authority) = req.uri().authority() {
         let auth_str = authority.as_str();
         println!(
             "[dbg] No Proxy-Authorization header; using URI authority: {}",
@@ -140,43 +141,58 @@ pub fn parse_proxy_auth(req: &Request<Body>) -> Option<ClientConfig> {
             u,
             p.len()
         );
-        (u.to_string(), p.to_string())
-    } else {
-        println!("[dbg] No Proxy-Authorization header and no URI authority present");
-        return None;
-    };
+        return Some((u.to_string(), p.to_string()));
+    }
+    None
+}
 
-    // Parse client info from username (e.g. "client_country-US").
-    // Use the base user (before the first '_') to check the hardcoded DB.
-    let cfg = parse_username(&username);
+/// Validate a username (may include metadata like `user_country-US`) and password
+/// against the hardcoded USERS DB. On success returns the parsed ClientConfig.
+pub fn validate_user_credentials(username: &str, password: &str) -> Option<ClientConfig> {
+    // parse username into ClientConfig (extract base user + metadata)
+    let cfg = parse_username(username);
     let base_user = cfg.user.clone();
 
-    // Check hardcoded user DB first — only known users are accepted.
     if let Some(user) = lookup_user(&base_user) {
         println!(
             "[dbg] user '{}' found in hardcoded DB (active={})",
             base_user, user.active
         );
-        if user.active {
-            if password == user.password {
-                println!("[dbg] auth success for '{}' via hardcoded DB", base_user);
-                return Some(cfg);
-            } else {
-                println!(
-                    "[dbg] auth failed for '{}' via hardcoded DB (password mismatch)",
-                    base_user
-                );
-                return None;
-            }
-        } else {
-            println!("[dbg] user '{}' exists but is not active", base_user);
-            return None;
+
+        if user.active && password == user.password {
+            println!("[dbg] auth success for '{}' via hardcoded DB", base_user);
+            return Some(cfg);
         }
+
+        println!(
+            "[dbg] auth failed for '{}' via hardcoded DB (active={}, password_match={})",
+            base_user,
+            user.active,
+            password == user.password
+        );
+        return None;
     }
 
-    // If username is not in the hardcoded DB, reject.
     println!("[dbg] user '{}' not found in DB; rejecting", base_user);
     None
+}
+
+pub fn parse_proxy_auth(req: &Request<Body>) -> Option<ClientConfig> {
+    println!("[dbg] parse_proxy_auth called");
+
+    // prefer header, then fall back to URI userinfo
+    let creds = extract_credentials_from_header(req).or_else(|| extract_credentials_from_uri(req));
+
+    let (username, password) = match creds {
+        Some((u, p)) => (u, p),
+        None => {
+            println!("[dbg] No Proxy-Authorization header and no URI authority present");
+            return None;
+        }
+    };
+
+    // delegate actual validation to the extracted function
+    validate_user_credentials(&username, &password)
 }
 
 pub async fn handle(req: Request<Body>) -> Result<Response<Body>, Infallible> {

@@ -350,158 +350,167 @@ pub fn parse_proxy_auth(req: &Request<Body>) -> Option<ClientConfig> {
     validate_user_credentials(&username, &password)
 }
 
-pub async fn handle(req: Request<Body>) -> Result<Response<Body>, Infallible> {
-    // Check if this is a CONNECT request (HTTPS tunneling)
-    if req.method() == hyper::Method::CONNECT {
-        println!("[*] CONNECT request received for: {}", req.uri());
+fn auth_required_response() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::PROXY_AUTHENTICATION_REQUIRED)
+        .header("Proxy-Authenticate", r#"Basic realm="shaheen-proxy""#)
+        .body(Body::from("Proxy authentication required\n"))
+        .unwrap()
+}
 
-        // Authenticate CONNECT requests too
-        if parse_proxy_auth(&req).is_none() {
-            println!("[*] CONNECT request without valid proxy auth");
-            let resp = Response::builder()
-                .status(StatusCode::PROXY_AUTHENTICATION_REQUIRED)
-                .header("Proxy-Authenticate", r#"Basic realm="shaheen-proxy""#)
-                .body(Body::from("Proxy authentication required\n"))
-                .unwrap();
-            return Ok(resp);
-        }
+async fn handle_connect_tunnel(
+    req: Request<Body>,
+    _cfg: ClientConfig,
+) -> Result<Response<Body>, Infallible> {
+    println!("[*] CONNECT request received for: {}", req.uri());
 
-        // Extract target host:port from request URI (clone it before moving req)
-        let host_port = req
-            .uri()
-            .authority()
-            .map(|a| a.as_str().to_string())
-            .unwrap_or_default();
+    // Extract target host:port from request URI
+    let host_port = req
+        .uri()
+        .authority()
+        .map(|a| a.as_str().to_string())
+        .unwrap_or_default();
 
-        if host_port.is_empty() {
-            let resp = Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Body::from("Bad CONNECT request: missing host:port\n"))
-                .unwrap();
-            return Ok(resp);
-        }
-
-        // Spawn a task to handle the CONNECT tunnel
-        let host_port_clone = host_port.clone();
-        tokio::spawn(async move {
-            match hyper::upgrade::on(req).await {
-                Ok(upgraded) => {
-                    println!("[*] CONNECT tunnel established to {}", host_port_clone);
-
-                    // Connect to upstream target
-                    match tokio::net::TcpStream::connect(&host_port_clone).await {
-                        Ok(mut upstream) => {
-                            let mut upgraded = upgraded;
-
-                            // Relay data bidirectionally
-                            match tokio::io::copy_bidirectional(&mut upgraded, &mut upstream).await
-                            {
-                                Ok((from_client, from_server)) => {
-                                    println!(
-                                        "[*] CONNECT tunnel closed: {}↑ {}↓",
-                                        from_client, from_server
-                                    );
-                                }
-                                Err(e) => {
-                                    eprintln!("[!] CONNECT tunnel error: {}", e);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "[!] Failed to connect to upstream {}: {}",
-                                host_port_clone, e
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("[!] Failed to upgrade CONNECT connection: {}", e);
-                }
-            }
-        });
-
-        // Respond with 200 Connection Established to allow upgrade
+    if host_port.is_empty() {
         let resp = Response::builder()
-            .status(StatusCode::OK)
-            .body(Body::empty())
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from("Bad CONNECT request: missing host:port\n"))
             .unwrap();
         return Ok(resp);
     }
 
-    if let Some(cfg) = parse_proxy_auth(&req) {
-        println!("[*] New request with client config: {:?}", cfg);
+    // Spawn a task to handle the CONNECT tunnel
+    let host_port_clone = host_port.clone();
+    tokio::spawn(async move {
+        match hyper::upgrade::on(req).await {
+            Ok(upgraded) => {
+                println!("[*] CONNECT tunnel established to {}", host_port_clone);
 
-        // Forward the request as-is: keep the original URI and headers (do not strip userinfo).
-        // We still remove hop-by-hop and proxy-specific headers to avoid leaking them upstream.
-        println!("[dbg] Forwarding original request URI: {}", req.uri());
-        let forward_uri = req.uri().clone();
+                // Connect to upstream target
+                match tokio::net::TcpStream::connect(&host_port_clone).await {
+                    Ok(mut upstream) => {
+                        let mut upgraded = upgraded;
 
-        // Build outbound request, copying method and headers (but removing proxy headers)
-        let mut builder = Request::builder()
-            .method(req.method().clone())
-            .uri(forward_uri);
-
-        // Copy headers except hop-by-hop and proxy-specific ones
-        for (name, value) in req.headers().iter() {
-            // print key/value
-            println!(
-                "[dbg] processing header : {} / Value: {}",
-                name.as_str(),
-                value.to_str().unwrap_or("<invalid>")
-            );
-            let name_str = name.as_str();
-            if name_str.eq_ignore_ascii_case("proxy-authorization")
-                || name_str.eq_ignore_ascii_case("proxy-authenticate")
-                || name_str.eq_ignore_ascii_case("proxy-connection")
-                || name_str.eq_ignore_ascii_case("connection")
-            {
-                continue;
+                        // Relay data bidirectionally
+                        match tokio::io::copy_bidirectional(&mut upgraded, &mut upstream).await {
+                            Ok((from_client, from_server)) => {
+                                println!(
+                                    "[*] CONNECT tunnel closed: {}↑ {}↓",
+                                    from_client, from_server
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("[!] CONNECT tunnel error: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[!] Failed to connect to upstream {}: {}",
+                            host_port_clone, e
+                        );
+                    }
+                }
             }
-            // keep Host header as-is (do not rewrite)
-            builder = builder.header(name_str, value.clone());
-        }
-
-        let outbound_req = match builder.body(req.into_body()) {
-            Ok(r) => r,
             Err(e) => {
-                let resp = Response::builder()
-                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(Body::from(format!(
-                        "Internal error building request: {}\n",
-                        e
-                    )))
-                    .unwrap();
-                return Ok(resp);
-            }
-        };
-        // print outbound request URI
-        println!("[dbg] Outbound request URI: {}", outbound_req.uri());
-        // Perform the request using HTTPS connector (supports both HTTP and HTTPS)
-        let https = HttpsConnector::new();
-        let client = Client::builder().build::<_, hyper::Body>(https);
-        match client.request(outbound_req).await {
-            Ok(resp) => {
-                // Return the upstream response directly to the client
-                Ok(resp)
-            }
-            Err(err) => {
-                let resp = Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(Body::from(format!("Upstream request failed: {}\n", err)))
-                    .unwrap();
-                Ok(resp)
+                eprintln!("[!] Failed to upgrade CONNECT connection: {}", e);
             }
         }
-    } else {
-        println!("[*] Request without valid proxy auth");
+    });
 
-        // Respond with 407 Proxy Authentication Required and a Proxy-Authenticate header
-        let resp = Response::builder()
-            .status(StatusCode::PROXY_AUTHENTICATION_REQUIRED)
-            .header("Proxy-Authenticate", r#"Basic realm="shaheen-proxy""#)
-            .body(Body::from("Proxy authentication required\n"))
-            .unwrap();
-        Ok(resp)
+    // Respond with 200 Connection Established to allow upgrade
+    let resp = Response::builder()
+        .status(StatusCode::OK)
+        .body(Body::empty())
+        .unwrap();
+    Ok(resp)
+}
+
+fn build_outbound_request(req: Request<Body>) -> Result<Request<Body>, String> {
+    let forward_uri = req.uri().clone();
+    let mut builder = Request::builder()
+        .method(req.method().clone())
+        .uri(forward_uri);
+
+    // Copy headers except hop-by-hop and proxy-specific ones
+    for (name, value) in req.headers().iter() {
+        println!(
+            "[dbg] processing header: {} / Value: {}",
+            name.as_str(),
+            value.to_str().unwrap_or("<invalid>")
+        );
+        let name_str = name.as_str();
+        if name_str.eq_ignore_ascii_case("proxy-authorization")
+            || name_str.eq_ignore_ascii_case("proxy-authenticate")
+            || name_str.eq_ignore_ascii_case("proxy-connection")
+            || name_str.eq_ignore_ascii_case("connection")
+        {
+            continue;
+        }
+        builder = builder.header(name_str, value.clone());
+    }
+
+    builder
+        .body(req.into_body())
+        .map_err(|e| format!("Failed to build request: {}", e))
+}
+
+async fn handle_http_request(
+    req: Request<Body>,
+    _cfg: ClientConfig,
+) -> Result<Response<Body>, Infallible> {
+    println!("[dbg] Forwarding original request URI: {}", req.uri());
+
+    // Build outbound request
+    let outbound_req = match build_outbound_request(req) {
+        Ok(r) => r,
+        Err(e) => {
+            let resp = Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from(format!(
+                    "Internal error building request: {}\n",
+                    e
+                )))
+                .unwrap();
+            return Ok(resp);
+        }
+    };
+
+    println!("[dbg] Outbound request URI: {}", outbound_req.uri());
+
+    // Perform the request using HTTPS connector (supports both HTTP and HTTPS)
+    let https = HttpsConnector::new();
+    let client = Client::builder().build::<_, hyper::Body>(https);
+
+    match client.request(outbound_req).await {
+        Ok(resp) => Ok(resp),
+        Err(err) => {
+            let resp = Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Body::from(format!("Upstream request failed: {}\n", err)))
+                .unwrap();
+            Ok(resp)
+        }
+    }
+}
+
+pub async fn handle(req: Request<Body>) -> Result<Response<Body>, Infallible> {
+    // Authenticate ALL requests first (CONNECT and HTTP/HTTPS)
+    let cfg = match parse_proxy_auth(&req) {
+        Some(cfg) => {
+            println!("[*] New request with client config: {:?}", cfg);
+            cfg
+        }
+        None => {
+            println!("[*] Request without valid proxy auth");
+            return Ok(auth_required_response());
+        }
+    };
+
+    // Route authenticated requests based on method
+    if req.method() == hyper::Method::CONNECT {
+        handle_connect_tunnel(req, cfg).await
+    } else {
+        handle_http_request(req, cfg).await
     }
 }

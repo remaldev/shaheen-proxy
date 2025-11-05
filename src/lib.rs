@@ -16,6 +16,7 @@ pub struct ClientConfig {
     pub proxies: Vec<u32>,
     /// rotate proxies on/off
     pub rotate: bool,
+    pub parse_error: Option<String>,
 }
 
 pub fn parse_username(raw: &str) -> ClientConfig {
@@ -30,6 +31,7 @@ pub fn parse_username(raw: &str) -> ClientConfig {
     let mut ttl = None;
     let mut proxies: Vec<u32> = Vec::new();
     let mut rotate = false;
+    let mut parse_error: Option<String> = None;
 
     for part in parts {
         // special flag: rot-on (no value)
@@ -42,29 +44,123 @@ pub fn parse_username(raw: &str) -> ClientConfig {
         let key = kv.next().unwrap_or("");
         let val = kv.next();
 
+        // ensure value is present and not empty for key-value items
+        if let Some(vstr) = val {
+            if vstr.is_empty() {
+                let msg = format!("empty value for key '{}'", key);
+                println!("[dbg] {}", msg);
+                if parse_error.is_none() {
+                    parse_error = Some(msg);
+                }
+                continue;
+            }
+        }
+
         match (key, val) {
-            ("country", Some(v)) => country = Some(v.to_string()),
-            ("area", Some(v)) => area = Some(v.to_string()),
-            ("city", Some(v)) => city = Some(v.to_string()),
+            ("country", Some(v)) => {
+                if country.is_some() {
+                    let msg = format!("duplicate country value: {}", v);
+                    println!("[dbg] {}", msg);
+                    if parse_error.is_none() {
+                        parse_error = Some(msg);
+                    }
+                } else {
+                    country = Some(v.to_string());
+                }
+            }
+            ("area", Some(v)) => {
+                if area.is_some() {
+                    let msg = format!("duplicate area value: {}", v);
+                    println!("[dbg] {}", msg);
+                    if parse_error.is_none() {
+                        parse_error = Some(msg);
+                    }
+                } else {
+                    area = Some(v.to_string());
+                }
+            }
+            ("city", Some(v)) => {
+                if city.is_some() {
+                    let msg = format!("duplicate city value: {}", v);
+                    println!("[dbg] {}", msg);
+                    if parse_error.is_none() {
+                        parse_error = Some(msg);
+                    }
+                } else {
+                    city = Some(v.to_string());
+                }
+            }
             ("sid", Some(v)) => {
-                // enforce max length and allow only ASCII alphanumeric to avoid overflow
-                if v.len() <= 10 && v.chars().all(|c| c.is_ascii_alphanumeric()) {
+                if sid.is_some() {
+                    let msg = format!("duplicate sid value: {}", v);
+                    println!("[dbg] {}", msg);
+                    if parse_error.is_none() {
+                        parse_error = Some(msg);
+                    }
+                } else if v.len() <= 10 && v.chars().all(|c| c.is_ascii_alphanumeric()) {
                     sid = Some(v.to_string());
                 } else {
-                    println!("[dbg] sid invalid or too long (len={}): '{}'", v.len(), v);
+                    let msg = format!("sid invalid or too long (len={}): '{}'", v.len(), v);
+                    println!("[dbg] {}", msg);
+                    if parse_error.is_none() {
+                        parse_error = Some(msg);
+                    }
                 }
             }
             ("ttl", Some(v)) => {
-                if let Ok(n) = v.parse::<u64>() {
+                if ttl.is_some() {
+                    let msg = format!("duplicate ttl value: {}", v);
+                    println!("[dbg] {}", msg);
+                    if parse_error.is_none() {
+                        parse_error = Some(msg);
+                    }
+                } else if let Ok(n) = v.parse::<u64>() {
                     ttl = Some(n);
                 } else {
-                    println!("[dbg] ttl value not a number: {}", v);
+                    let msg = format!("ttl value not a number: {}", v);
+                    println!("[dbg] {}", msg);
+                    if parse_error.is_none() {
+                        parse_error = Some(msg);
+                    }
                 }
             }
             ("p", Some(v)) => {
-                // v like "1-4-5" -> split by '-' and parse ints
-                let items = v.split('-').filter_map(|s| s.parse::<u32>().ok());
-                proxies.extend(items);
+                if v.is_empty() {
+                    let msg = "empty proxies list".to_string();
+                    println!("[dbg] {}", msg);
+                    if parse_error.is_none() {
+                        parse_error = Some(msg);
+                    }
+                } else {
+                    // v like "1-4-5" -> split by '-' and parse ints, treat duplicates as error
+                    for s in v.split('-') {
+                        if s.is_empty() {
+                            let msg = "empty proxy index in 'p'".to_string();
+                            println!("[dbg] {}", msg);
+                            if parse_error.is_none() {
+                                parse_error = Some(msg);
+                            }
+                            continue;
+                        }
+                        if let Ok(idx) = s.parse::<u32>() {
+                            if !proxies.contains(&idx) {
+                                proxies.push(idx);
+                            } else {
+                                let msg = format!("duplicate proxy index {}", idx);
+                                println!("[dbg] {}", msg);
+                                if parse_error.is_none() {
+                                    parse_error = Some(msg);
+                                }
+                            }
+                        } else {
+                            let msg = format!("invalid proxy index '{}'", s);
+                            println!("[dbg] {}", msg);
+                            if parse_error.is_none() {
+                                parse_error = Some(msg);
+                            }
+                        }
+                    }
+                }
             }
             // unknown or missing value: ignore
             _ => {}
@@ -80,7 +176,46 @@ pub fn parse_username(raw: &str) -> ClientConfig {
         ttl,
         proxies,
         rotate,
+        parse_error,
     }
+}
+
+/// Validate a username (may include metadata like `user_country-US`) and password
+/// against the hardcoded USERS DB. On success returns the parsed ClientConfig.
+pub fn validate_user_credentials(username: &str, password: &str) -> Option<ClientConfig> {
+    // parse username into ClientConfig (extract base user + metadata)
+    let cfg = parse_username(username);
+    let base_user = cfg.user.clone();
+
+    // if parsing found an error (duplicate keys, empty values, invalid formats)
+    // reject the credentials immediately
+    if let Some(ref err) = cfg.parse_error {
+        println!("[dbg] parse error in username '{}': {}", username, err);
+        return None;
+    }
+
+    if let Some(user) = lookup_user(&base_user) {
+        println!(
+            "[dbg] user '{}' found in hardcoded DB (active={})",
+            base_user, user.active
+        );
+
+        if user.active && password == user.password {
+            println!("[dbg] auth success for '{}' via hardcoded DB", base_user);
+            return Some(cfg);
+        }
+
+        println!(
+            "[dbg] auth failed for '{}' via hardcoded DB (active={}, password_match={})",
+            base_user,
+            user.active,
+            password == user.password
+        );
+        return None;
+    }
+
+    println!("[dbg] user '{}' not found in DB; rejecting", base_user);
+    None
 }
 
 #[derive(Debug)]
@@ -192,37 +327,6 @@ fn extract_credentials_from_uri(req: &Request<Body>) -> Option<(String, String)>
         );
         return Some((u.to_string(), p.to_string()));
     }
-    None
-}
-
-/// Validate a username (may include metadata like `user_country-US`) and password
-/// against the hardcoded USERS DB. On success returns the parsed ClientConfig.
-pub fn validate_user_credentials(username: &str, password: &str) -> Option<ClientConfig> {
-    // parse username into ClientConfig (extract base user + metadata)
-    let cfg = parse_username(username);
-    let base_user = cfg.user.clone();
-
-    if let Some(user) = lookup_user(&base_user) {
-        println!(
-            "[dbg] user '{}' found in hardcoded DB (active={})",
-            base_user, user.active
-        );
-
-        if user.active && password == user.password {
-            println!("[dbg] auth success for '{}' via hardcoded DB", base_user);
-            return Some(cfg);
-        }
-
-        println!(
-            "[dbg] auth failed for '{}' via hardcoded DB (active={}, password_match={})",
-            base_user,
-            user.active,
-            password == user.password
-        );
-        return None;
-    }
-
-    println!("[dbg] user '{}' not found in DB; rejecting", base_user);
     None
 }
 

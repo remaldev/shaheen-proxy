@@ -423,7 +423,10 @@ fn log_request(source_ip: &str, username: &str, proxy: &str, target: &str) {
     }
 }
 
-pub async fn handle(req: Request<Body>) -> Result<Response<Body>, Infallible> {
+pub async fn handle(
+    req: Request<Body>,
+    remote_addr: std::net::SocketAddr,
+) -> Result<Response<Body>, Infallible> {
     // Step 1: Extract credentials first
     let creds =
         extract_credentials_from_header(&req).or_else(|| extract_credentials_from_uri(&req));
@@ -438,12 +441,13 @@ pub async fn handle(req: Request<Body>) -> Result<Response<Body>, Infallible> {
         None => return Ok(auth_required_response()),
     };
 
-    // Get source IP
+    // Get source IP (prefer x-forwarded-for if behind proxy, otherwise use direct connection IP)
+    let remote_ip = remote_addr.ip().to_string();
     let source_ip = req
         .headers()
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown");
+        .unwrap_or(&remote_ip);
 
     // Get proxy and target info
     let target = req.uri().to_string();

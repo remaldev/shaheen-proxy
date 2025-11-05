@@ -8,7 +8,14 @@ use std::convert::Infallible;
 pub struct ClientConfig {
     pub user: String,
     pub country: Option<String>,
+    pub area: Option<String>,
+    pub city: Option<String>,
     pub sid: Option<String>,
+    pub ttl: Option<u64>,
+    /// proxies pool indices (e.g. p-1-4-5 -> [1,4,5])
+    pub proxies: Vec<u32>,
+    /// rotate proxies on/off
+    pub rotate: bool,
 }
 
 pub fn parse_username(raw: &str) -> ClientConfig {
@@ -17,21 +24,63 @@ pub fn parse_username(raw: &str) -> ClientConfig {
     let user = parts.next().unwrap_or("").to_string();
 
     let mut country = None;
+    let mut area = None;
+    let mut city = None;
     let mut sid = None;
+    let mut ttl = None;
+    let mut proxies: Vec<u32> = Vec::new();
+    let mut rotate = false;
 
     for part in parts {
+        // special flag: rot-on (no value)
+        if part == "rot-on" {
+            rotate = true;
+            continue;
+        }
+
         let mut kv = part.splitn(2, '-');
         let key = kv.next().unwrap_or("");
-        let val = kv.next().unwrap_or("");
+        let val = kv.next();
 
-        match key {
-            "country" => country = Some(val.to_string()),
-            "sid" => sid = Some(val.to_string()),
+        match (key, val) {
+            ("country", Some(v)) => country = Some(v.to_string()),
+            ("area", Some(v)) => area = Some(v.to_string()),
+            ("city", Some(v)) => city = Some(v.to_string()),
+            ("sid", Some(v)) => {
+                // enforce max length and allow only ASCII alphanumeric to avoid overflow
+                if v.len() <= 10 && v.chars().all(|c| c.is_ascii_alphanumeric()) {
+                    sid = Some(v.to_string());
+                } else {
+                    println!("[dbg] sid invalid or too long (len={}): '{}'", v.len(), v);
+                }
+            }
+            ("ttl", Some(v)) => {
+                if let Ok(n) = v.parse::<u64>() {
+                    ttl = Some(n);
+                } else {
+                    println!("[dbg] ttl value not a number: {}", v);
+                }
+            }
+            ("p", Some(v)) => {
+                // v like "1-4-5" -> split by '-' and parse ints
+                let items = v.split('-').filter_map(|s| s.parse::<u32>().ok());
+                proxies.extend(items);
+            }
+            // unknown or missing value: ignore
             _ => {}
         }
     }
 
-    ClientConfig { user, country, sid }
+    ClientConfig {
+        user,
+        country,
+        area,
+        city,
+        sid,
+        ttl,
+        proxies,
+        rotate,
+    }
 }
 
 #[derive(Debug)]

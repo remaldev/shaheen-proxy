@@ -1,7 +1,7 @@
 use base64::Engine as _;
 use hyper::client::Client;
-use hyper::client::HttpConnector;
 use hyper::{Body, Request, Response, StatusCode};
+use hyper_tls::HttpsConnector;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -351,6 +351,84 @@ pub fn parse_proxy_auth(req: &Request<Body>) -> Option<ClientConfig> {
 }
 
 pub async fn handle(req: Request<Body>) -> Result<Response<Body>, Infallible> {
+    // Check if this is a CONNECT request (HTTPS tunneling)
+    if req.method() == hyper::Method::CONNECT {
+        println!("[*] CONNECT request received for: {}", req.uri());
+
+        // Authenticate CONNECT requests too
+        if parse_proxy_auth(&req).is_none() {
+            println!("[*] CONNECT request without valid proxy auth");
+            let resp = Response::builder()
+                .status(StatusCode::PROXY_AUTHENTICATION_REQUIRED)
+                .header("Proxy-Authenticate", r#"Basic realm="shaheen-proxy""#)
+                .body(Body::from("Proxy authentication required\n"))
+                .unwrap();
+            return Ok(resp);
+        }
+
+        // Extract target host:port from request URI (clone it before moving req)
+        let host_port = req
+            .uri()
+            .authority()
+            .map(|a| a.as_str().to_string())
+            .unwrap_or_default();
+
+        if host_port.is_empty() {
+            let resp = Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from("Bad CONNECT request: missing host:port\n"))
+                .unwrap();
+            return Ok(resp);
+        }
+
+        // Spawn a task to handle the CONNECT tunnel
+        let host_port_clone = host_port.clone();
+        tokio::spawn(async move {
+            match hyper::upgrade::on(req).await {
+                Ok(upgraded) => {
+                    println!("[*] CONNECT tunnel established to {}", host_port_clone);
+
+                    // Connect to upstream target
+                    match tokio::net::TcpStream::connect(&host_port_clone).await {
+                        Ok(mut upstream) => {
+                            let mut upgraded = upgraded;
+
+                            // Relay data bidirectionally
+                            match tokio::io::copy_bidirectional(&mut upgraded, &mut upstream).await
+                            {
+                                Ok((from_client, from_server)) => {
+                                    println!(
+                                        "[*] CONNECT tunnel closed: {}↑ {}↓",
+                                        from_client, from_server
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!("[!] CONNECT tunnel error: {}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[!] Failed to connect to upstream {}: {}",
+                                host_port_clone, e
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[!] Failed to upgrade CONNECT connection: {}", e);
+                }
+            }
+        });
+
+        // Respond with 200 Connection Established to allow upgrade
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::empty())
+            .unwrap();
+        return Ok(resp);
+    }
+
     if let Some(cfg) = parse_proxy_auth(&req) {
         println!("[*] New request with client config: {:?}", cfg);
 
@@ -397,10 +475,11 @@ pub async fn handle(req: Request<Body>) -> Result<Response<Body>, Infallible> {
                 return Ok(resp);
             }
         };
-
-        // Perform the request using a simple HTTP connector (no TLS here).
-        // For HTTPS you'd need to enable TLS connector (e.g., hyper_tls).
-        let client: Client<HttpConnector> = Client::new();
+        // print outbound request URI
+        println!("[dbg] Outbound request URI: {}", outbound_req.uri());
+        // Perform the request using HTTPS connector (supports both HTTP and HTTPS)
+        let https = HttpsConnector::new();
+        let client = Client::builder().build::<_, hyper::Body>(https);
         match client.request(outbound_req).await {
             Ok(resp) => {
                 // Return the upstream response directly to the client

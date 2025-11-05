@@ -1,4 +1,6 @@
 use base64::Engine as _;
+use hyper::client::Client;
+use hyper::client::HttpConnector;
 use hyper::{Body, Request, Response, StatusCode};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
@@ -352,9 +354,66 @@ pub async fn handle(req: Request<Body>) -> Result<Response<Body>, Infallible> {
     if let Some(cfg) = parse_proxy_auth(&req) {
         println!("[*] New request with client config: {:?}", cfg);
 
-        // For now we don't forward; just respond OK
-        let body = "shaheen-proxy: OK (no upstream yet)\n";
-        Ok(Response::new(Body::from(body)))
+        // Forward the request as-is: keep the original URI and headers (do not strip userinfo).
+        // We still remove hop-by-hop and proxy-specific headers to avoid leaking them upstream.
+        println!("[dbg] Forwarding original request URI: {}", req.uri());
+        let forward_uri = req.uri().clone();
+
+        // Build outbound request, copying method and headers (but removing proxy headers)
+        let mut builder = Request::builder()
+            .method(req.method().clone())
+            .uri(forward_uri);
+
+        // Copy headers except hop-by-hop and proxy-specific ones
+        for (name, value) in req.headers().iter() {
+            // print key/value
+            println!(
+                "[dbg] processing header : {} / Value: {}",
+                name.as_str(),
+                value.to_str().unwrap_or("<invalid>")
+            );
+            let name_str = name.as_str();
+            if name_str.eq_ignore_ascii_case("proxy-authorization")
+                || name_str.eq_ignore_ascii_case("proxy-authenticate")
+                || name_str.eq_ignore_ascii_case("proxy-connection")
+                || name_str.eq_ignore_ascii_case("connection")
+            {
+                continue;
+            }
+            // keep Host header as-is (do not rewrite)
+            builder = builder.header(name_str, value.clone());
+        }
+
+        let outbound_req = match builder.body(req.into_body()) {
+            Ok(r) => r,
+            Err(e) => {
+                let resp = Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::from(format!(
+                        "Internal error building request: {}\n",
+                        e
+                    )))
+                    .unwrap();
+                return Ok(resp);
+            }
+        };
+
+        // Perform the request using a simple HTTP connector (no TLS here).
+        // For HTTPS you'd need to enable TLS connector (e.g., hyper_tls).
+        let client: Client<HttpConnector> = Client::new();
+        match client.request(outbound_req).await {
+            Ok(resp) => {
+                // Return the upstream response directly to the client
+                Ok(resp)
+            }
+            Err(err) => {
+                let resp = Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(Body::from(format!("Upstream request failed: {}\n", err)))
+                    .unwrap();
+                Ok(resp)
+            }
+        }
     } else {
         println!("[*] Request without valid proxy auth");
 

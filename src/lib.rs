@@ -3,6 +3,8 @@ use hyper::{Body, Request, Response, StatusCode};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::fs::OpenOptions;
+use std::io::Write;
 
 #[derive(Debug)]
 pub struct ClientConfig {
@@ -405,14 +407,51 @@ async fn handle_http_request(
     Ok(response.body(Body::from(resp_body.to_vec())).unwrap())
 }
 
+fn log_request(source_ip: &str, username: &str, proxy: &str, target: &str) {
+    let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+    let log_line = format!(
+        "{} | {} | {} | {} | {}\n",
+        timestamp, source_ip, username, proxy, target
+    );
+
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("proxy.log")
+    {
+        let _ = file.write_all(log_line.as_bytes());
+    }
+}
+
 pub async fn handle(req: Request<Body>) -> Result<Response<Body>, Infallible> {
-    // Step 1: Validate auth
-    let cfg = match parse_proxy_auth(&req) {
+    // Step 1: Extract credentials first
+    let creds =
+        extract_credentials_from_header(&req).or_else(|| extract_credentials_from_uri(&req));
+    let (username, password) = match creds {
         Some(c) => c,
         None => return Ok(auth_required_response()),
     };
 
-    // Step 2: Config is already validated in parse_username
+    // Step 2: Validate auth
+    let cfg = match validate_user_credentials(&username, &password) {
+        Some(c) => c,
+        None => return Ok(auth_required_response()),
+    };
+
+    // Get source IP
+    let source_ip = req
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown");
+
+    // Get proxy and target info
+    let target = req.uri().to_string();
+    let proxy_url = select_upstream_proxy(&cfg);
+    let proxy_used = proxy_url.as_ref().map(|s| s.as_str()).unwrap_or("direct");
+
+    // Log request with full username string
+    log_request(source_ip, &username, proxy_used, &target);
     println!("[*] {} {} - user:{}", req.method(), req.uri(), cfg.user);
 
     // Step 3: Forward request

@@ -1,3 +1,5 @@
+mod proxy_provider;
+
 use base64::Engine as _;
 use hyper::{Body, Request, Response, StatusCode};
 use once_cell::sync::Lazy;
@@ -6,11 +8,13 @@ use std::convert::Infallible;
 use std::fs::OpenOptions;
 use std::io::Write;
 
+pub use proxy_provider::ProxyManager;
+
 #[derive(Debug)]
 pub struct ClientConfig {
     pub user: String,
     pub country: Option<String>,
-    pub area: Option<String>,
+    pub state: Option<String>,
     pub city: Option<String>,
     pub sid: Option<String>,
     pub ttl: Option<u64>,
@@ -26,7 +30,7 @@ pub fn parse_username(raw: &str) -> ClientConfig {
     let user = parts.next().unwrap_or("").to_string();
 
     let mut country = None;
-    let mut area = None;
+    let mut state = None;
     let mut city = None;
     let mut sid = None;
     let mut ttl = None;
@@ -57,7 +61,7 @@ pub fn parse_username(raw: &str) -> ClientConfig {
         }
 
         match (key, val) {
-            ("country", Some(v)) => {
+            ("c", Some(v)) => {
                 if country.is_some() {
                     let msg = format!("duplicate country value: {}", v);
                     if parse_error.is_none() {
@@ -67,17 +71,17 @@ pub fn parse_username(raw: &str) -> ClientConfig {
                     country = Some(v.to_string());
                 }
             }
-            ("area", Some(v)) => {
-                if area.is_some() {
-                    let msg = format!("duplicate area value: {}", v);
+            ("st", Some(v)) => {
+                if state.is_some() {
+                    let msg = format!("duplicate state value: {}", v);
                     if parse_error.is_none() {
                         parse_error = Some(msg);
                     }
                 } else {
-                    area = Some(v.to_string());
+                    state = Some(v.to_string());
                 }
             }
-            ("city", Some(v)) => {
+            ("cy", Some(v)) => {
                 if city.is_some() {
                     let msg = format!("duplicate city value: {}", v);
                     if parse_error.is_none() {
@@ -87,7 +91,7 @@ pub fn parse_username(raw: &str) -> ClientConfig {
                     city = Some(v.to_string());
                 }
             }
-            ("sid", Some(v)) => {
+            ("s", Some(v)) => {
                 if sid.is_some() {
                     let msg = format!("duplicate sid value: {}", v);
                     if parse_error.is_none() {
@@ -159,7 +163,7 @@ pub fn parse_username(raw: &str) -> ClientConfig {
     ClientConfig {
         user,
         country,
-        area,
+        state,
         city,
         sid,
         ttl,
@@ -251,13 +255,32 @@ fn auth_required_response() -> Response<Body> {
         .unwrap()
 }
 
-fn select_upstream_proxy(_cfg: &ClientConfig) -> Option<String> {
-    // TODO: Implement your proxy selection logic
-    // Use cfg.proxies, cfg.country, cfg.rotate, cfg.sid
-    // Return None for direct, or Some("http://proxy:port") for upstream proxy
+// Lazy-loaded proxy manager singleton
+static PROXY_MANAGER: Lazy<Option<ProxyManager>> =
+    Lazy::new(|| match ProxyManager::new("proxies.json") {
+        Ok(manager) => Some(manager),
+        Err(e) => {
+            eprintln!("[!] Failed to load proxies.json: {}", e);
+            None
+        }
+    });
 
-    // Example: Some("http://upstream-proxy:8080".to_string())
-    None
+pub fn select_upstream_proxy(cfg: &ClientConfig) -> Option<String> {
+    let manager = PROXY_MANAGER.as_ref().cloned().unwrap();
+    // Let proxy manager handle the selection logic
+    println!("-------------------------+++++++");
+    let result = manager.select_proxy(&cfg);
+
+    // Check if Direct (index 1) was explicitly requested
+    let direct_requested = cfg.proxies.contains(&1);
+
+    if result.is_none() && !direct_requested {
+        // No proxy available and Direct not explicitly requested - fail hard
+        eprintln!("[!] No proxy available and Direct connection not explicitly requested (p-1)");
+        panic!("No proxy provider available for request");
+    }
+
+    result
 }
 
 async fn handle_connect_tunnel(
@@ -450,13 +473,12 @@ pub async fn handle(
         .unwrap_or(&remote_ip);
 
     // Get proxy and target info
-    let target = req.uri().to_string();
-    let proxy_url = select_upstream_proxy(&cfg);
-    let proxy_used = proxy_url.as_ref().map(|s| s.as_str()).unwrap_or("direct");
+    // let target = req.uri().to_string();
+    // let proxy_url = select_upstream_proxy(&cfg);
+    // let proxy_used = proxy_url.as_ref().map(|s| s.as_str()).unwrap_or("direct");
 
     // Log request with full username string
-    log_request(source_ip, &username, proxy_used, &target);
-    println!("[*] {} {} - user:{}", req.method(), req.uri(), cfg.user);
+    // log_request(source_ip, &username, proxy_used, &target);
 
     // Step 3: Forward request
     if req.method() == hyper::Method::CONNECT {

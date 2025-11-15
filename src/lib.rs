@@ -1,29 +1,13 @@
 mod proxy_provider;
-
+use crate::proxy_provider::{ClientConfig, UpstreamEnum, User};
 use base64::Engine as _;
 use hyper::{Body, Request, Response, StatusCode};
 use once_cell::sync::Lazy;
+use proxy_provider::ProxyManager;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fs::OpenOptions;
 use std::io::Write;
-
-pub use proxy_provider::ProxyManager;
-
-#[derive(Debug)]
-pub struct ClientConfig {
-    pub user: String,
-    pub country: Option<String>,
-    pub state: Option<String>,
-    pub city: Option<String>,
-    pub sid: Option<String>,
-    pub ttl: Option<u64>,
-    /// proxies pool indices (e.g. p-1-4-5 -> [1,4,5])
-    pub proxies: Vec<u32>,
-    /// rotate proxies on/off
-    pub rotate: bool,
-    pub parse_error: Option<String>,
-}
 
 pub fn parse_username(raw: &str) -> ClientConfig {
     let mut parts = raw.split('_');
@@ -34,17 +18,9 @@ pub fn parse_username(raw: &str) -> ClientConfig {
     let mut city = None;
     let mut sid = None;
     let mut ttl = None;
-    let mut proxies: Vec<u32> = Vec::new();
-    let mut rotate = false;
     let mut parse_error: Option<String> = None;
 
     for part in parts {
-        // special flag: rot-on (no value)
-        if part == "rot-on" {
-            rotate = true;
-            continue;
-        }
-
         let mut kv = part.splitn(2, '-');
         let key = kv.next().unwrap_or("");
         let val = kv.next();
@@ -121,40 +97,6 @@ pub fn parse_username(raw: &str) -> ClientConfig {
                     }
                 }
             }
-            ("p", Some(v)) => {
-                if v.is_empty() {
-                    let msg = "empty proxies list".to_string();
-                    if parse_error.is_none() {
-                        parse_error = Some(msg);
-                    }
-                } else {
-                    // v like "1-4-5" -> split by '-' and parse ints, treat duplicates as error
-                    for s in v.split('-') {
-                        if s.is_empty() {
-                            let msg = "empty proxy index in 'p'".to_string();
-                            if parse_error.is_none() {
-                                parse_error = Some(msg);
-                            }
-                            continue;
-                        }
-                        if let Ok(idx) = s.parse::<u32>() {
-                            if !proxies.contains(&idx) {
-                                proxies.push(idx);
-                            } else {
-                                let msg = format!("duplicate proxy index {}", idx);
-                                if parse_error.is_none() {
-                                    parse_error = Some(msg);
-                                }
-                            }
-                        } else {
-                            let msg = format!("invalid proxy index '{}'", s);
-                            if parse_error.is_none() {
-                                parse_error = Some(msg);
-                            }
-                        }
-                    }
-                }
-            }
             // unknown or missing value: ignore
             _ => {}
         }
@@ -167,8 +109,6 @@ pub fn parse_username(raw: &str) -> ClientConfig {
         city,
         sid,
         ttl,
-        proxies,
-        rotate,
         parse_error,
     }
 }
@@ -193,12 +133,6 @@ pub fn validate_user_credentials(username: &str, password: &str) -> Option<Clien
     }
 
     None
-}
-
-#[derive(Debug)]
-struct User {
-    password: &'static str,
-    active: bool,
 }
 
 // Static hardcoded user DB. Edit here to add/remove users.
@@ -267,105 +201,226 @@ static PROXY_MANAGER: Lazy<Option<ProxyManager>> =
 
 pub fn select_upstream_proxy(cfg: &ClientConfig) -> Option<String> {
     let manager = PROXY_MANAGER.as_ref().cloned().unwrap();
-    // Let proxy manager handle the selection logic
-    println!("-------------------------+++++++");
     let result = manager.select_proxy(&cfg);
+    result
+}
 
-    // Check if Direct (index 1) was explicitly requested
-    let direct_requested = cfg.proxies.contains(&1);
-
-    if result.is_none() && !direct_requested {
-        // No proxy available and Direct not explicitly requested - fail hard
-        eprintln!("[!] No proxy available and Direct connection not explicitly requested (p-1)");
-        panic!("No proxy provider available for request");
+fn parse_upstream(proxy: &str) -> UpstreamEnum {
+    if proxy == "direct" {
+        return UpstreamEnum::Direct;
     }
 
-    result
+    let url = url::Url::parse(proxy).unwrap();
+    let host = url.host_str().unwrap().to_string();
+    let port = url.port_or_known_default().unwrap();
+    let user = url.username().to_string();
+    let pass = url.password().map(|p| p.to_string());
+    let auth: Option<String> = pass
+        .as_ref()
+        .map(|p| base64::engine::general_purpose::STANDARD.encode(format!("{user}:{p}")));
+
+    if proxy.starts_with("socks5") {
+        UpstreamEnum::Socks5 {
+            host,
+            port,
+            user,
+            pass,
+        }
+    } else {
+        UpstreamEnum::Http { host, port, auth }
+    }
+}
+
+/// Intercept and analyze upstream proxy responses - log only, don't modify response
+fn intercept_upstream_response(response_text: &str) {
+    // Log the full upstream response for server-side analysis
+    eprintln!("[UPSTREAM RESPONSE] {}", response_text);
+
+    // Analyze and log status - but don't modify the response
+    if response_text.contains("407") || response_text.contains("Proxy Authentication Required") {
+        eprintln!("[ANALYSIS] Detected auth failure (407)");
+    } else if response_text.contains("403")
+        || response_text.contains("Bandwidth")
+        || response_text.contains("limit")
+        || response_text.contains("rate limit")
+        || response_text.contains("quota")
+    {
+        eprintln!("[ANALYSIS] Detected bandwidth/limit error from upstream");
+    } else if response_text.starts_with("HTTP/1.1 200") || response_text.starts_with("HTTP/1.0 200")
+    {
+        eprintln!("[SUCCESS] Upstream connection succeeded (200 OK)");
+    } else if response_text.starts_with("HTTP/1.1 502") || response_text.starts_with("HTTP/1.0 502")
+    {
+        eprintln!("[ANALYSIS] Bad Gateway (502)");
+    } else if response_text.starts_with("HTTP/1.1 503") || response_text.starts_with("HTTP/1.0 503")
+    {
+        eprintln!("[ANALYSIS] Service Unavailable (503)");
+    } else {
+        eprintln!(
+            "[ANALYSIS] Other response code / {}",
+            response_text.lines().next().unwrap_or("")
+        );
+    }
+}
+
+/// Intercept and analyze SOCKS5/general connection errors - log only
+fn intercept_connection_error(error_msg: &str) {
+    eprintln!("[CONNECTION ERROR] {}", error_msg);
+
+    let error_lower = error_msg.to_lowercase();
+
+    // Analyze and log error type - but don't modify the response
+    if error_lower.contains("auth") || error_lower.contains("authentication") {
+        eprintln!("[ANALYSIS] Error type: Authentication failure");
+    } else if error_lower.contains("timeout") || error_lower.contains("timed out") {
+        eprintln!("[ANALYSIS] Error type: Connection timeout");
+    } else if error_lower.contains("refused") || error_lower.contains("unreachable") {
+        eprintln!("[ANALYSIS] Error type: Connection refused/unreachable");
+    } else {
+        eprintln!("[ANALYSIS] Error type: Generic connection error");
+    }
+}
+
+/// Establish connection through upstream proxy
+/// Returns TcpStream on success, or Response with error for client
+async fn connect_through_upstream(
+    proxy_url: &str,
+    target: &str,
+) -> Result<tokio::net::TcpStream, Response<Body>> {
+    let upstream_result = match parse_upstream(proxy_url) {
+        UpstreamEnum::Direct => tokio::net::TcpStream::connect(target).await,
+
+        UpstreamEnum::Socks5 {
+            host,
+            port,
+            user,
+            pass,
+        } => {
+            let proxy_addr = format!("{}:{}", host, port);
+            let parts: Vec<&str> = target.split(':').collect();
+            let target_host = parts[0];
+            let target_port: u16 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(443);
+
+            let result = if let Some(password) = pass {
+                tokio_socks::tcp::Socks5Stream::connect_with_password(
+                    proxy_addr.as_str(),
+                    (target_host, target_port),
+                    user.as_str(),
+                    password.as_str(),
+                )
+                .await
+                .map(|s| s.into_inner())
+            } else {
+                tokio_socks::tcp::Socks5Stream::connect(
+                    proxy_addr.as_str(),
+                    (target_host, target_port),
+                )
+                .await
+                .map(|s| s.into_inner())
+            };
+
+            result.map_err(|e| {
+                eprintln!("[SOCKS5 ERROR] {}", e);
+                std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+            })
+        }
+
+        UpstreamEnum::Http { host, port, auth } => {
+            let proxy_addr = format!("{}:{}", host, port);
+
+            match tokio::net::TcpStream::connect(&proxy_addr).await {
+                Ok(mut stream) => {
+                    // Send CONNECT request
+                    let mut connect_req =
+                        format!("CONNECT {} HTTP/1.1\r\nHost: {}\r\n", target, target);
+                    if let Some(auth_header) = auth {
+                        connect_req
+                            .push_str(&format!("Proxy-Authorization: Basic {}\r\n", auth_header));
+                    }
+                    connect_req.push_str("\r\n");
+
+                    if let Err(e) =
+                        tokio::io::AsyncWriteExt::write_all(&mut stream, connect_req.as_bytes())
+                            .await
+                    {
+                        eprintln!("[HTTP PROXY] Failed to send CONNECT request: {}", e);
+                        return Err(Response::builder()
+                            .status(StatusCode::BAD_GATEWAY)
+                            .body(Body::from("Failed to connect to upstream proxy"))
+                            .unwrap());
+                    }
+
+                    // Read CONNECT response
+                    let mut buf = vec![0u8; 1024];
+                    let n = match tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await {
+                        Ok(n) => n,
+                        Err(e) => {
+                            eprintln!("[HTTP PROXY] Failed to read CONNECT response: {}", e);
+                            return Err(Response::builder()
+                                .status(StatusCode::BAD_GATEWAY)
+                                .body(Body::from("Upstream proxy connection failed"))
+                                .unwrap());
+                        }
+                    };
+
+                    let resp = String::from_utf8_lossy(&buf[..n]);
+
+                    // Log and analyze response
+                    intercept_upstream_response(&resp);
+
+                    // Check for errors
+                    if !resp.starts_with("HTTP/1.1 200") && !resp.starts_with("HTTP/1.0 200") {
+                        eprintln!("[ERROR] CONNECT failed, upstream returned non-200");
+                        return Err(Response::builder()
+                            .status(StatusCode::BAD_GATEWAY)
+                            .body(Body::from(resp.to_string()))
+                            .unwrap());
+                    }
+
+                    Ok(stream)
+                }
+                Err(e) => {
+                    eprintln!("[HTTP PROXY] Failed to connect: {}", e);
+                    Err(e)
+                }
+            }
+        }
+    };
+
+    // Handle connection result
+    match upstream_result {
+        Ok(stream) => Ok(stream),
+        Err(e) => {
+            eprintln!("[UPSTREAM CONNECTION FAILED] {}", e);
+            intercept_connection_error(&e.to_string());
+            Err(Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Body::from(format!("Failed to connect: {}", e)))
+                .unwrap())
+        }
+    }
 }
 
 async fn handle_connect_tunnel(
     req: Request<Body>,
-    cfg: ClientConfig,
+    proxy_url: String,
 ) -> Result<Response<Body>, Infallible> {
     let target = req.uri().authority().unwrap().as_str().to_string();
-    let proxy_url = select_upstream_proxy(&cfg);
 
-    // CONNECT target and selected upstream proxy (if any)
+    // Establish upstream connection (handles all proxy types)
+    let mut upstream = match connect_through_upstream(&proxy_url, &target).await {
+        Ok(stream) => stream,
+        Err(error_response) => return Ok(error_response),
+    };
 
+    // Spawn bidirectional tunnel
     tokio::spawn(async move {
         let mut client = hyper::upgrade::on(req).await.unwrap();
-
-        let mut upstream = if let Some(proxy) = proxy_url {
-            if proxy.starts_with("socks5") {
-                // SOCKS5 proxy
-                let proxy_url_parsed = url::Url::parse(&proxy).unwrap();
-                let proxy_host = proxy_url_parsed.host_str().unwrap();
-                let proxy_port = proxy_url_parsed.port().unwrap();
-                let proxy_addr = format!("{}:{}", proxy_host, proxy_port);
-
-                // Parse target host:port
-                let target_parts: Vec<&str> = target.split(':').collect();
-                let target_host = target_parts[0];
-                let target_port: u16 = target_parts[1].parse().unwrap();
-
-                if let Some(password) = proxy_url_parsed.password() {
-                    tokio_socks::tcp::Socks5Stream::connect_with_password(
-                        proxy_addr.as_str(),
-                        (target_host, target_port),
-                        proxy_url_parsed.username(),
-                        password,
-                    )
-                    .await
-                    .unwrap()
-                    .into_inner()
-                } else {
-                    tokio_socks::tcp::Socks5Stream::connect(
-                        proxy_addr.as_str(),
-                        (target_host, target_port),
-                    )
-                    .await
-                    .unwrap()
-                    .into_inner()
-                }
-            } else {
-                // HTTP/HTTPS proxy - send CONNECT request
-                let proxy_url_parsed = url::Url::parse(&proxy).unwrap();
-                let proxy_host = proxy_url_parsed.host_str().unwrap();
-                let proxy_port = proxy_url_parsed.port().unwrap();
-                let proxy_addr = format!("{}:{}", proxy_host, proxy_port);
-
-                let mut stream = tokio::net::TcpStream::connect(&proxy_addr).await.unwrap();
-
-                // Build CONNECT request with auth if present
-                let mut connect_req =
-                    format!("CONNECT {} HTTP/1.1\r\nHost: {}\r\n", target, target);
-                if let Some(password) = proxy_url_parsed.password() {
-                    let auth = format!("{}:{}", proxy_url_parsed.username(), password);
-                    let auth_encoded = base64::engine::general_purpose::STANDARD.encode(auth);
-                    connect_req
-                        .push_str(&format!("Proxy-Authorization: Basic {}\r\n", auth_encoded));
-                }
-                connect_req.push_str("\r\n");
-
-                tokio::io::AsyncWriteExt::write_all(&mut stream, connect_req.as_bytes())
-                    .await
-                    .unwrap();
-
-                // Read 200 response
-                let mut buf = vec![0u8; 1024];
-                tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
-                    .await
-                    .unwrap();
-
-                stream
-            }
-        } else {
-            tokio::net::TcpStream::connect(&target).await.unwrap()
-        };
-
+        eprintln!("[TUNNEL] Starting bidirectional copy for {}", target);
         tokio::io::copy_bidirectional(&mut client, &mut upstream)
             .await
             .ok();
+        eprintln!("[TUNNEL] Connection closed for {}", target);
     });
 
     Ok(Response::builder()
@@ -374,27 +429,66 @@ async fn handle_connect_tunnel(
         .unwrap())
 }
 
+/// Build reqwest client configured for the upstream proxy
+fn build_reqwest_client(upstream: UpstreamEnum) -> reqwest::Client {
+    match upstream {
+        UpstreamEnum::Direct => reqwest::Client::builder().build().unwrap(),
+
+        UpstreamEnum::Socks5 {
+            host,
+            port,
+            user,
+            pass,
+        } => {
+            let url = if !user.is_empty() {
+                match pass {
+                    Some(p) => format!("socks5://{}:{}@{}:{}", user, p, host, port),
+                    None => format!("socks5://{}@{}:{}", user, host, port),
+                }
+            } else {
+                format!("socks5://{}:{}", host, port)
+            };
+
+            reqwest::Client::builder()
+                .proxy(reqwest::Proxy::all(&url).unwrap())
+                .build()
+                .unwrap()
+        }
+
+        UpstreamEnum::Http { host, port, auth } => {
+            let proxy_addr = format!("http://{}:{}", host, port);
+            let mut builder =
+                reqwest::Client::builder().proxy(reqwest::Proxy::all(&proxy_addr).unwrap());
+
+            if let Some(auth_header) = auth {
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert(
+                    reqwest::header::PROXY_AUTHORIZATION,
+                    format!("Basic {}", auth_header).parse().unwrap(),
+                );
+                builder = builder.default_headers(headers);
+            }
+
+            builder.build().unwrap()
+        }
+    }
+}
+
 async fn handle_http_request(
     req: Request<Body>,
-    cfg: ClientConfig,
+    proxy_url: String,
 ) -> Result<Response<Body>, Infallible> {
+    let upstream = parse_upstream(&proxy_url);
     let uri = req.uri().to_string();
     let method = req.method().clone();
     let headers = req.headers().clone();
     let body = hyper::body::to_bytes(req.into_body()).await.unwrap();
-    let proxy_url = select_upstream_proxy(&cfg);
 
-    // HTTP request and selected upstream proxy (if any)
+    // Build configured client
+    let client = build_reqwest_client(upstream);
 
-    // Build client with optional proxy
-    let mut builder = reqwest::Client::builder();
-    if let Some(proxy) = proxy_url {
-        builder = builder.proxy(reqwest::Proxy::all(proxy).unwrap());
-    }
-    let client = builder.build().unwrap();
-
-    // Build request
-    let mut req_builder = client.request(method.as_str().parse().unwrap(), &uri);
+    // Build outgoing request
+    let mut req_builder = client.request(method, &uri);
     for (name, value) in headers.iter() {
         let name_str = name.as_str();
         if !name_str.starts_with("proxy-") && name_str != "connection" {
@@ -403,25 +497,24 @@ async fn handle_http_request(
     }
     req_builder = req_builder.body(body.to_vec());
 
-    // Send request
+    // Send request with error interception
     let resp = match req_builder.send().await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[!] Request failed: {} - Error: {}", uri, e);
-            panic!("Request failed");
-        }
-    };
-    let status = resp.status();
-    let resp_headers = resp.headers().clone();
-    let resp_body = match resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("[!] Failed to read response body: {} - Error: {}", uri, e);
-            panic!("Response read failed");
+            eprintln!("[HTTP REQUEST ERROR] {}", e);
+            intercept_connection_error(&e.to_string());
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Body::from(format!("Request failed: {}", e)))
+                .unwrap());
         }
     };
 
-    // Build response
+    // Forward response to client
+    let status = resp.status();
+    let resp_headers = resp.headers().clone();
+    let resp_body = resp.bytes().await.unwrap();
+
     let mut response = Response::builder().status(status.as_u16());
     for (name, value) in resp_headers.iter() {
         response = response.header(name.as_str(), value.as_bytes());
@@ -473,17 +566,14 @@ pub async fn handle(
         .unwrap_or(&remote_ip);
 
     // Get proxy and target info
-    // let target = req.uri().to_string();
-    // let proxy_url = select_upstream_proxy(&cfg);
-    // let proxy_used = proxy_url.as_ref().map(|s| s.as_str()).unwrap_or("direct");
+    let target = req.uri().to_string();
+    let proxy_url = select_upstream_proxy(&cfg).unwrap_or_else(|| "direct".to_string());
 
-    // Log request with full username string
-    // log_request(source_ip, &username, proxy_used, &target);
-
+    log_request(source_ip, &username, &proxy_url, &target);
     // Step 3: Forward request
     if req.method() == hyper::Method::CONNECT {
-        handle_connect_tunnel(req, cfg).await
+        handle_connect_tunnel(req, proxy_url).await
     } else {
-        handle_http_request(req, cfg).await
+        handle_http_request(req, proxy_url).await
     }
 }

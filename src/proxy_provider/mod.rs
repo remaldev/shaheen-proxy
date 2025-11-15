@@ -5,6 +5,23 @@ use std::collections::HashMap;
 // Re-export submodules
 pub use proxy_manager::ProxyManager;
 
+#[derive(Debug)]
+pub struct ClientConfig {
+    pub user: String,
+    pub country: Option<String>,
+    pub state: Option<String>,
+    pub city: Option<String>,
+    pub sid: Option<String>,
+    pub ttl: Option<u64>,
+    pub parse_error: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct User {
+    pub password: &'static str,
+    pub active: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
     pub url: String,
@@ -37,4 +54,19 @@ pub struct ProxiesConfig {
     pub shared_config: SharedConfig,
     #[serde(default)]
     pub accounts: Vec<Account>,
+}
+
+pub enum UpstreamEnum {
+    Direct,
+    Socks5 {
+        host: String,
+        port: u16,
+        user: String,
+        pass: Option<String>,
+    },
+    Http {
+        host: String,
+        port: u16,
+        auth: Option<String>,
+    },
 }

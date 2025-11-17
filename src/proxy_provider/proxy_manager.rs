@@ -92,11 +92,16 @@ impl ProxyManager {
         let content = fs::read_to_string(config_path)?;
         let proxies: ProxiesConfig = serde_json::from_str(&content)?;
         // filter active proxies
-        let accounts = proxies
+        let mut accounts = proxies
             .accounts
             .into_iter()
             .filter(|a| a.active)
+            .map(|mut a| {
+                a.countries = a.countries.to_lowercase();
+                a
+            })
             .collect::<Vec<_>>();
+        accounts.shuffle(&mut rand::thread_rng());
         let config = proxies.shared_config;
         println!("Loaded {} active proxies", accounts.len());
         Ok(Self {

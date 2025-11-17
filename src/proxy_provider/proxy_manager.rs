@@ -111,10 +111,17 @@ impl ProxyManager {
     }
 
     pub fn select_proxy(&self, settings: &ClientConfig) -> Option<String> {
-        // TODO: Filter by country support
         // TODO: filter proxies by session support
         // TODO: handle session id range for hosts per country proxies
-        let proxy = self.proxies.choose(&mut rand::thread_rng())?;
+        let mut proxies = self.proxies.clone();
+        // filter by country if specified
+        if let Some(country) = &settings.country {
+            proxies = proxies
+                .into_iter()
+                .filter(|p| p.countries.contains(&country.to_lowercase()))
+                .collect();
+        }
+        let proxy = proxies.choose(&mut rand::thread_rng())?;
         let (protocol, username, password, host, port) = parse_url(&proxy.url).unwrap();
         let base_url = self.templates[proxy.provider.as_str()]
             .template

@@ -1,7 +1,8 @@
+mod helpers;
 mod proxy_manager;
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-
 // Re-export submodules
 pub use proxy_manager::ProxyManager;
 
@@ -33,6 +34,10 @@ pub struct Account {
     pub active: bool,
     #[serde(default)]
     pub hosts_per_country: HashMap<String, u32>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub r#type: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

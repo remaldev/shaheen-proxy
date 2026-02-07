@@ -34,11 +34,34 @@ impl ProxyManager {
     }
 
     pub fn select_proxy(&self, settings: &ClientConfig) -> Option<String> {
-        // TODO: filter proxies by session support
         // TODO: handle session id range for hosts per country proxies
 
         // Filter proxies based on settings
         let mut filtered: Vec<&Account> = self.proxies.iter().collect();
+
+        // Filter by session support if session ID requested
+        if settings.sid.is_some() {
+            filtered.retain(|p| {
+                // Only allow proxies whose templates support {session} in opts
+                if let Some(template) = self.templates.get(p.provider.as_str()) {
+                    template.opts.iter().any(|opt| {
+                        if let Some(arr) = opt.as_array() {
+                            arr.iter().any(|item| {
+                                if let Some(s) = item.as_str() {
+                                    s.contains("{session}")
+                                } else {
+                                    false
+                                }
+                            })
+                        } else {
+                            false
+                        }
+                    })
+                } else {
+                    false
+                }
+            });
+        }
 
         // Filter by country if specified
         if let Some(country) = &settings.country {
@@ -55,6 +78,9 @@ impl ProxyManager {
                     .unwrap_or(false)
             });
         }
+
+        // TODO: If proxy has hosts_per_country and no host_id specified,
+        // randomly select a host_id from the available range for session stickiness
 
         let proxy = filtered.choose(&mut rand::thread_rng())?;
 

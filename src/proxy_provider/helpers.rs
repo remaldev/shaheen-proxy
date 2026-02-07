@@ -13,7 +13,7 @@ pub fn parse_url(url_str: &str) -> Option<(String, String, String, String, u16)>
 
     let protocol = url.scheme().to_string();
     let username = url.username().to_string();
-    let password = url.password().unwrap().to_string();
+    let password = url.password().unwrap_or("").to_string();
     let host = url.host_str()?.to_string();
     let port = url.port_or_known_default()?;
 

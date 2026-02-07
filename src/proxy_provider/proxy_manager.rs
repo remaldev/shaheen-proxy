@@ -21,7 +21,7 @@ impl ProxyManager {
             .filter(|a| a.active)
             .map(|mut a| {
                 a.countries = a.countries.to_lowercase();
-                a
+                return a;
             })
             .collect::<Vec<_>>();
         accounts.shuffle(&mut rand::thread_rng());
@@ -36,36 +36,43 @@ impl ProxyManager {
     pub fn select_proxy(&self, settings: &ClientConfig) -> Option<String> {
         // TODO: filter proxies by session support
         // TODO: handle session id range for hosts per country proxies
-        let mut proxies = self.proxies.clone();
-        // filter by country if specified
-        if let Some(country) = &settings.country {
-            proxies = proxies
-                .into_iter()
-                .filter(|p| p.r#type != "random" && p.countries.contains(&country.to_lowercase()))
-                .collect();
-        }
-        if let Some(host_id) = &settings.host_id {
-             proxies = proxies
-                .into_iter()
-                .filter(|p| {
-                    if let Some(hosts_per_country) = &p.hosts_per_country {
-                        hosts_per_country.values().any(|&id| id as u64 == *host_id)
-                    } else {
-                        false
-                    }
-                })
-                .collect();
-        }
-        let proxy = proxies.choose(&mut rand::thread_rng())?;
-        // check if proxy have hosts_per_country field
-        if let Some(hosts_per_country) = &proxy.hosts_per_country {
-            println!("Selected proxy: {:?}", hosts_per_country);
-            
-        }
-        let (protocol, username, password, host, port) = parse_url(&proxy.url).unwrap();
 
-        // Build URL string efficiently
-        let template = &self.templates[proxy.provider.as_str()];
+        // Filter proxies based on settings
+        let mut filtered: Vec<&Account> = self.proxies.iter().collect();
+
+        // Filter by country if specified
+        if let Some(country) = &settings.country {
+            let country_lower = country.to_lowercase();
+            filtered.retain(|p| p.r#type != "random" && p.countries.contains(&country_lower));
+        }
+
+        // Filter by host_id if specified
+        if let Some(host_id) = settings.host_id {
+            filtered.retain(|p| {
+                p.hosts_per_country
+                    .as_ref()
+                    .map(|hosts| hosts.values().any(|&id| id as u64 == host_id))
+                    .unwrap_or(false)
+            });
+        }
+
+        let proxy = filtered.choose(&mut rand::thread_rng())?;
+
+        let (protocol, username, password, host, port) = parse_url(&proxy.url)?;
+
+        // Get template for provider
+        let template = match self.templates.get(proxy.provider.as_str()) {
+            Some(t) => t,
+            None => {
+                eprintln!(
+                    "[ERROR] Template '{}' not found for proxy URL: {}",
+                    proxy.provider, proxy.url
+                );
+                return None;
+            }
+        };
+
+        // Build URL from template
         let mut base_url = template
             .template
             .replace("{protocol}", &protocol)
@@ -76,11 +83,13 @@ impl ProxyManager {
 
         let mut opts = String::new();
 
-        // loop through self.templates[proxy.provider.as_str()].opts and build opts string
-        for opt in &self.templates[proxy.provider.as_str()].opts {
-            for word in opt.as_array().unwrap() {
-                if let Some(true) = process_word(word, &settings, &mut opts) {
-                    break;
+        // Process template options
+        for opt in &template.opts {
+            if let Some(arr) = opt.as_array() {
+                for word in arr {
+                    if let Some(true) = process_word(word, settings, &mut opts) {
+                        break;
+                    }
                 }
             }
         }

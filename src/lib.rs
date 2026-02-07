@@ -18,6 +18,7 @@ pub fn parse_username(raw: &str) -> ClientConfig {
     let mut city = None;
     let mut sid = None;
     let mut ttl = None;
+    let mut host_id = None;
     let mut parse_error: Option<String> = None;
 
     for part in parts {
@@ -82,6 +83,21 @@ pub fn parse_username(raw: &str) -> ClientConfig {
                     }
                 }
             }
+            ("h", Some(v)) => {
+                if host_id.is_some() {
+                    let msg = format!("duplicate host_id value: {}", v);
+                    if parse_error.is_none() {
+                        parse_error = Some(msg);
+                    }
+                } else if let Ok(n) = v.parse::<u64>() {
+                    host_id = Some(n);
+                } else {
+                    let msg = format!("host_id value not a number: {}", v);
+                    if parse_error.is_none() {
+                        parse_error = Some(msg);
+                    }
+                }
+            }
             ("ttl", Some(v)) => {
                 if ttl.is_some() {
                     let msg = format!("duplicate ttl value: {}", v);
@@ -102,15 +118,20 @@ pub fn parse_username(raw: &str) -> ClientConfig {
         }
     }
 
-    ClientConfig {
+    let mut conf = ClientConfig {
         user,
         country,
         state,
         city,
         sid,
+        host_id,
         ttl,
         parse_error,
+    };
+    if conf.sid.is_some() && conf.ttl.is_none() {
+        conf.ttl = Some(1);
     }
+    conf
 }
 
 /// Validate a username (may include metadata like `user_country-US`) and password
@@ -139,9 +160,9 @@ pub fn validate_user_credentials(username: &str, password: &str) -> Option<Clien
 static USERS: Lazy<HashMap<&'static str, User>> = Lazy::new(|| {
     let mut m = HashMap::new();
     m.insert(
-        "shaheen",
+        "test",
         User {
-            password: "100000001",
+            password: "test",
             active: true,
         },
     );

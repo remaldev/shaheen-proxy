@@ -13,6 +13,7 @@ pub struct ClientConfig {
     pub state: Option<String>,
     pub city: Option<String>,
     pub sid: Option<String>,
+    pub host_id: Option<u64>,
     pub ttl: Option<u64>,
     pub parse_error: Option<String>,
 }
@@ -33,7 +34,7 @@ pub struct Account {
     #[serde(default)]
     pub active: bool,
     #[serde(default)]
-    pub hosts_per_country: HashMap<String, u32>,
+    pub hosts_per_country: Option<HashMap<String, u32>>,
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]

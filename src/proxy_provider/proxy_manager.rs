@@ -44,7 +44,24 @@ impl ProxyManager {
                 .filter(|p| p.r#type != "random" && p.countries.contains(&country.to_lowercase()))
                 .collect();
         }
+        if let Some(host_id) = &settings.host_id {
+             proxies = proxies
+                .into_iter()
+                .filter(|p| {
+                    if let Some(hosts_per_country) = &p.hosts_per_country {
+                        hosts_per_country.values().any(|&id| id as u64 == *host_id)
+                    } else {
+                        false
+                    }
+                })
+                .collect();
+        }
         let proxy = proxies.choose(&mut rand::thread_rng())?;
+        // check if proxy have hosts_per_country field
+        if let Some(hosts_per_country) = &proxy.hosts_per_country {
+            println!("Selected proxy: {:?}", hosts_per_country);
+            
+        }
         let (protocol, username, password, host, port) = parse_url(&proxy.url).unwrap();
 
         // Build URL string efficiently

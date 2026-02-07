@@ -1,10 +1,13 @@
 use base64::Engine as _;
 use hyper::{Body, Request};
-use shaheen_proxy::parse_proxy_auth;
+use shaheen_proxy::{parse_proxy_auth, UserStore};
 
 #[test]
 fn test_shaheen_accepts() {
-    let creds = "shaheen:100000001";
+    let user_store = UserStore::new();
+    user_store.add_user("shaheen".to_string(), "psswd".to_string(), true);
+
+    let creds = "shaheen:psswd";
     let b64 = base64::engine::general_purpose::STANDARD.encode(creds);
     let header = format!("Basic {}", b64);
 
@@ -13,13 +16,16 @@ fn test_shaheen_accepts() {
         .body(Body::empty())
         .unwrap();
 
-    let cfg = parse_proxy_auth(&req).expect("shaheen should authenticate");
+    let cfg = parse_proxy_auth(&req, &user_store).expect("shaheen should authenticate");
     assert_eq!(cfg.user, "shaheen");
 }
 
 #[test]
 fn test_shaheen_wrong_password_rejects() {
-    let creds = "shaheen:wrongpass";
+    let user_store = UserStore::new();
+    user_store.add_user("shaheen".to_string(), "psswd".to_string(), true);
+
+    let creds = "shaheen:wrongpsswd";
     let b64 = base64::engine::general_purpose::STANDARD.encode(creds);
     let header = format!("Basic {}", b64);
 
@@ -28,13 +34,16 @@ fn test_shaheen_wrong_password_rejects() {
         .body(Body::empty())
         .unwrap();
 
-    let cfg = parse_proxy_auth(&req);
+    let cfg = parse_proxy_auth(&req, &user_store);
     assert!(cfg.is_none());
 }
 
 #[test]
 fn test_shaheen_with_metadata_accepts() {
-    let creds = "shaheen_country-US:100000001";
+    let user_store = UserStore::new();
+    user_store.add_user("shaheen".to_string(), "psswd".to_string(), true);
+
+    let creds = "shaheen_c-US:psswd";
     let b64 = base64::engine::general_purpose::STANDARD.encode(creds);
     let header = format!("Basic {}", b64);
 
@@ -43,13 +52,17 @@ fn test_shaheen_with_metadata_accepts() {
         .body(Body::empty())
         .unwrap();
 
-    let cfg = parse_proxy_auth(&req).expect("shaheen with metadata should authenticate");
+    let cfg =
+        parse_proxy_auth(&req, &user_store).expect("shaheen with metadata should authenticate");
     assert_eq!(cfg.user, "shaheen");
 }
 
 #[test]
 fn test_unknown_user_rejects() {
-    let creds = "client_country-US:somepass";
+    let user_store = UserStore::new();
+    user_store.add_user("shaheen".to_string(), "100000001".to_string(), true);
+
+    let creds = "client_c-MA:somepass";
     let b64 = base64::engine::general_purpose::STANDARD.encode(creds);
     let header = format!("Basic {}", b64);
 
@@ -58,6 +71,6 @@ fn test_unknown_user_rejects() {
         .body(Body::empty())
         .unwrap();
 
-    let cfg = parse_proxy_auth(&req);
+    let cfg = parse_proxy_auth(&req, &user_store);
     assert!(cfg.is_none());
 }

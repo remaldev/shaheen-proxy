@@ -18,12 +18,6 @@ pub struct ClientConfig {
     pub parse_error: Option<String>,
 }
 
-#[derive(Debug)]
-pub struct User {
-    pub password: &'static str,
-    pub active: bool,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
     pub url: String,

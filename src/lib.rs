@@ -1,13 +1,14 @@
 mod proxy_provider;
 mod session_store;
+mod user_store;
 
-use crate::proxy_provider::{ClientConfig, UpstreamEnum, User};
+use crate::proxy_provider::{ClientConfig, UpstreamEnum};
 pub use crate::session_store::SessionStore;
+pub use crate::user_store::UserStore;
 use base64::Engine as _;
 use hyper::{Body, Request, Response, StatusCode};
 use once_cell::sync::Lazy;
 use proxy_provider::ProxyManager;
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -147,8 +148,12 @@ pub fn parse_username(raw: &str) -> ClientConfig {
 }
 
 /// Validate a username (may include metadata like `user_country-US`) and password
-/// against the hardcoded USERS DB. On success returns the parsed ClientConfig.
-pub fn validate_user_credentials(username: &str, password: &str) -> Option<ClientConfig> {
+/// against the UserStore. On success returns the parsed ClientConfig.
+pub fn validate_user_credentials(
+    username: &str,
+    password: &str,
+    user_store: &UserStore,
+) -> Option<ClientConfig> {
     // parse username into ClientConfig (extract base user + metadata)
     let cfg = parse_username(username);
     let base_user = cfg.user.clone();
@@ -158,31 +163,11 @@ pub fn validate_user_credentials(username: &str, password: &str) -> Option<Clien
         return None;
     }
 
-    if let Some(user) = lookup_user(&base_user) {
-        if user.active && password == user.password {
-            return Some(cfg);
-        }
-        return None;
+    if user_store.validate(&base_user, password) {
+        return Some(cfg);
     }
 
     None
-}
-
-// Static hardcoded user DB. Edit here to add/remove users.
-static USERS: Lazy<HashMap<&'static str, User>> = Lazy::new(|| {
-    let mut m = HashMap::new();
-    m.insert(
-        "test",
-        User {
-            password: "test",
-            active: true,
-        },
-    );
-    m
-});
-
-fn lookup_user(username: &str) -> Option<&'static User> {
-    USERS.get(username)
 }
 
 fn extract_credentials_from_header(req: &Request<Body>) -> Option<(String, String)> {
@@ -208,10 +193,10 @@ fn extract_credentials_from_uri(req: &Request<Body>) -> Option<(String, String)>
     Some((u.to_string(), p.to_string()))
 }
 
-pub fn parse_proxy_auth(req: &Request<Body>) -> Option<ClientConfig> {
+pub fn parse_proxy_auth(req: &Request<Body>, user_store: &UserStore) -> Option<ClientConfig> {
     let creds = extract_credentials_from_header(req).or_else(|| extract_credentials_from_uri(req));
     let (username, password) = creds?;
-    validate_user_credentials(&username, &password)
+    validate_user_credentials(&username, &password, user_store)
 }
 
 fn auth_required_response() -> Response<Body> {
@@ -592,6 +577,7 @@ pub async fn handle(
     req: Request<Body>,
     remote_addr: std::net::SocketAddr,
     session_store: Arc<SessionStore>,
+    user_store: Arc<UserStore>,
 ) -> Result<Response<Body>, Infallible> {
     // Step 1: Extract credentials first
     let creds =
@@ -602,7 +588,7 @@ pub async fn handle(
     };
 
     // Step 2: Validate auth
-    let cfg = match validate_user_credentials(&username, &password) {
+    let cfg = match validate_user_credentials(&username, &password, &user_store) {
         Some(c) => c,
         None => return Ok(auth_required_response()),
     };

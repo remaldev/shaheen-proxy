@@ -1,5 +1,8 @@
 mod proxy_provider;
+mod session_store;
+
 use crate::proxy_provider::{ClientConfig, UpstreamEnum, User};
+pub use crate::session_store::SessionStore;
 use base64::Engine as _;
 use hyper::{Body, Request, Response, StatusCode};
 use once_cell::sync::Lazy;
@@ -8,6 +11,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::sync::Arc;
 
 pub fn parse_username(raw: &str) -> ClientConfig {
     let mut parts = raw.split('_');
@@ -38,6 +42,7 @@ pub fn parse_username(raw: &str) -> ClientConfig {
         }
 
         match (key, val) {
+            // cy=Country is optional metadata for more granular proxy selection
             ("c", Some(v)) => {
                 if country.is_some() {
                     let msg = format!("duplicate country value: {}", v);
@@ -48,6 +53,7 @@ pub fn parse_username(raw: &str) -> ClientConfig {
                     country = Some(v.to_string());
                 }
             }
+            // st=State is optional metadata for more granular proxy selection
             ("st", Some(v)) => {
                 if state.is_some() {
                     let msg = format!("duplicate state value: {}", v);
@@ -58,6 +64,7 @@ pub fn parse_username(raw: &str) -> ClientConfig {
                     state = Some(v.to_string());
                 }
             }
+            // cy=City is optional metadata for more granular proxy selection
             ("cy", Some(v)) => {
                 if city.is_some() {
                     let msg = format!("duplicate city value: {}", v);
@@ -68,6 +75,8 @@ pub fn parse_username(raw: &str) -> ClientConfig {
                     city = Some(v.to_string());
                 }
             }
+            // Session ID (sid) is optional string identifier for session persistence
+            // - must be alphanumeric and <=10 chars if provided
             ("s", Some(v)) => {
                 if sid.is_some() {
                     let msg = format!("duplicate sid value: {}", v);
@@ -83,6 +92,7 @@ pub fn parse_username(raw: &str) -> ClientConfig {
                     }
                 }
             }
+            // host_id is optional numeric identifier for proxies that have fixed number of hosts
             ("h", Some(v)) => {
                 if host_id.is_some() {
                     let msg = format!("duplicate host_id value: {}", v);
@@ -98,6 +108,8 @@ pub fn parse_username(raw: &str) -> ClientConfig {
                     }
                 }
             }
+            // ttl=time to live in seconds for session persistence
+            // - optional, but if sid provided then ttl=0 or missing means 60 seconds
             ("ttl", Some(v)) => {
                 if ttl.is_some() {
                     let msg = format!("duplicate ttl value: {}", v);
@@ -129,7 +141,7 @@ pub fn parse_username(raw: &str) -> ClientConfig {
         parse_error,
     };
     if conf.sid.is_some() && conf.ttl.is_none() {
-        conf.ttl = Some(1);
+        conf.ttl = Some(60);
     }
     conf
 }
@@ -220,10 +232,26 @@ static PROXY_MANAGER: Lazy<Option<ProxyManager>> =
         }
     });
 
-pub fn select_upstream_proxy(cfg: &ClientConfig) -> Option<String> {
+pub fn select_upstream_proxy(cfg: &ClientConfig, session_store: &SessionStore) -> Option<String> {
+    // Check session store first if sid exists
+    if let Some(sid) = &cfg.sid {
+        if let Some(cached_proxy) = session_store.get(sid) {
+            return Some(cached_proxy);
+        }
+    }
+
+    // No cached session, select new proxy
     let manager = PROXY_MANAGER.as_ref().cloned().unwrap();
-    let result = manager.select_proxy(&cfg);
-    result
+    let proxy = manager.select_proxy(&cfg)?;
+
+    // Store in session if ttl provided
+    if let Some(ref sid) = cfg.sid {
+        if let Some(ttl) = cfg.ttl {
+            session_store.set(sid.clone(), proxy.clone(), ttl);
+        }
+    }
+
+    Some(proxy)
 }
 
 fn parse_upstream(proxy: &str) -> UpstreamEnum {
@@ -563,6 +591,7 @@ fn log_request(source_ip: &str, username: &str, proxy: &str, target: &str) {
 pub async fn handle(
     req: Request<Body>,
     remote_addr: std::net::SocketAddr,
+    session_store: Arc<SessionStore>,
 ) -> Result<Response<Body>, Infallible> {
     // Step 1: Extract credentials first
     let creds =
@@ -588,7 +617,8 @@ pub async fn handle(
 
     // Get proxy and target info
     let target = req.uri().to_string();
-    let proxy_url = select_upstream_proxy(&cfg).unwrap_or_else(|| "direct".to_string());
+    let proxy_url =
+        select_upstream_proxy(&cfg, &session_store).unwrap_or_else(|| "direct".to_string());
 
     log_request(source_ip, &username, &proxy_url, &target);
     // Step 3: Forward request

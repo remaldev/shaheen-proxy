@@ -1,5 +1,6 @@
 use hyper::service::{make_service_fn, service_fn};
 use hyper::Server;
+use shaheen_proxy::SessionStore;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -13,16 +14,22 @@ async fn main() {
     print!("\x1B[2J\x1B[1;1H");
     let addr = SocketAddr::from(([0, 0, 0, 0], PORT));
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT));
+    let session_store = Arc::new(SessionStore::new());
+
+    // Cleanup expired sessions every 60 seconds
+    SessionStore::spawn_cleanup_task(session_store.clone(), 60);
 
     let make_svc = make_service_fn(|conn: &hyper::server::conn::AddrStream| {
         let remote_addr = conn.remote_addr();
         let semaphore = semaphore.clone();
+        let session_store = session_store.clone();
         async move {
             Ok::<_, Infallible>(service_fn(move |req| {
                 let semaphore = semaphore.clone();
+                let session_store = session_store.clone();
                 async move {
                     let _permit = semaphore.acquire().await; // This queues when limit reached
-                    shaheen_proxy::handle(req, remote_addr).await
+                    shaheen_proxy::handle(req, remote_addr, session_store).await
                 }
             }))
         }

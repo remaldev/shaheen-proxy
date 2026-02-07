@@ -57,6 +57,7 @@ pub fn process_word(opt: &Value, settings: &ClientConfig, opts: &mut String) -> 
             "city" => settings.city.as_deref()?,
             "session" => settings.sid.as_deref()?,
             "ttl" => &settings.ttl?.to_string(),
+            "hostID" => &settings.host_id?.to_string(),
             _ => "",
         };
 

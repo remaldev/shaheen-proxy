@@ -34,32 +34,34 @@ impl ProxyManager {
     }
 
     pub fn select_proxy(&self, settings: &ClientConfig) -> Option<String> {
-        // TODO: handle session id range for hosts per country proxies
-
+        // TODO: support random host id even when no session id requested (for proxies with hosts_per_country)
         // Filter proxies based on settings
         let mut filtered: Vec<&Account> = self.proxies.iter().collect();
 
         // Filter by session support if session ID requested
         if settings.sid.is_some() {
             filtered.retain(|p| {
-                // Only allow proxies whose templates support {session} in opts
-                if let Some(template) = self.templates.get(p.provider.as_str()) {
-                    template.opts.iter().any(|opt| {
-                        if let Some(arr) = opt.as_array() {
-                            arr.iter().any(|item| {
-                                if let Some(s) = item.as_str() {
-                                    s.contains("{session}")
-                                } else {
-                                    false
-                                }
-                            })
-                        } else {
-                            false
-                        }
-                    })
-                } else {
-                    false
-                }
+                // Allow proxies with {session} support OR hosts_per_country (for host_id-based sessions)
+                let has_session_support =
+                    if let Some(template) = self.templates.get(p.provider.as_str()) {
+                        template.opts.iter().any(|opt| {
+                            if let Some(arr) = opt.as_array() {
+                                arr.iter().any(|item| {
+                                    if let Some(s) = item.as_str() {
+                                        s.contains("{session}")
+                                    } else {
+                                        false
+                                    }
+                                })
+                            } else {
+                                false
+                            }
+                        })
+                    } else {
+                        false
+                    };
+
+                has_session_support || p.hosts_per_country.is_some()
             });
         }
 
@@ -79,13 +81,58 @@ impl ProxyManager {
             });
         }
 
-        // TODO: If proxy has hosts_per_country and no host_id specified,
-        // randomly select a host_id from the available range for session stickiness
-
         let proxy = filtered.choose(&mut rand::thread_rng())?;
 
-        let (protocol, username, password, host, port) = parse_url(&proxy.url)?;
+        // Prepare settings (potentially with generated host_id and country for hosts_per_country proxies)
+        let settings_owned;
+        let final_settings: &ClientConfig;
 
+        // If proxy has hosts_per_country and session is requested, generate host_id
+        if let (Some(_), Some(hosts_map)) = (&settings.sid, &proxy.hosts_per_country) {
+            if settings.host_id.is_none() {
+                // Determine which country to use
+                let target_country = if let Some(country) = &settings.country {
+                    country.to_lowercase()
+                } else {
+                    // Pick random country from proxy's available countries
+                    let countries: Vec<&String> = hosts_map.keys().collect();
+                    countries.choose(&mut rand::thread_rng())?.to_string()
+                };
+
+                // Get max host_id for that country
+                if let Some(&max_hosts) = hosts_map.get(&target_country) {
+                    // Generate random host_id in range [1, max_hosts]
+                    let random_host_id = (rand::random::<u32>() % max_hosts) + 1;
+
+                    // Create modified settings
+                    settings_owned = ClientConfig {
+                        user: settings.user.clone(),
+                        country: Some(target_country),
+                        state: settings.state.clone(),
+                        city: settings.city.clone(),
+                        sid: settings.sid.clone(),
+                        host_id: Some(random_host_id as u64),
+                        ttl: settings.ttl,
+                        parse_error: None,
+                    };
+                    final_settings = &settings_owned;
+                } else {
+                    final_settings = settings;
+                }
+            } else {
+                final_settings = settings;
+            }
+        } else {
+            final_settings = settings;
+        }
+
+        // print new client config for debugging
+        println!("Selected proxy: {:#?}", final_settings);
+        let (protocol, username, password, host, port) = parse_url(&proxy.url)?;
+        println!(
+            "Parsed proxy URL - protocol: {}, username: {}, password: {}, host: {}, port: {}",
+            protocol, username, password, host, port
+        );
         // Get template for provider
         let template = match self.templates.get(proxy.provider.as_str()) {
             Some(t) => t,
@@ -113,7 +160,7 @@ impl ProxyManager {
         for opt in &template.opts {
             if let Some(arr) = opt.as_array() {
                 for word in arr {
-                    if let Some(true) = process_word(word, settings, &mut opts) {
+                    if let Some(true) = process_word(word, final_settings, &mut opts) {
                         break;
                     }
                 }

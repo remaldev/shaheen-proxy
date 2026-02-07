@@ -2,13 +2,12 @@ mod proxy_provider;
 mod session_store;
 mod user_store;
 
+pub use crate::proxy_provider::ProxyManager;
 use crate::proxy_provider::{ClientConfig, UpstreamEnum};
 pub use crate::session_store::SessionStore;
 pub use crate::user_store::UserStore;
 use base64::Engine as _;
 use hyper::{Body, Request, Response, StatusCode};
-use once_cell::sync::Lazy;
-use proxy_provider::ProxyManager;
 use std::convert::Infallible;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -207,17 +206,11 @@ fn auth_required_response() -> Response<Body> {
         .unwrap()
 }
 
-// Lazy-loaded proxy manager singleton
-static PROXY_MANAGER: Lazy<Option<ProxyManager>> =
-    Lazy::new(|| match ProxyManager::new("proxies.json") {
-        Ok(manager) => Some(manager),
-        Err(e) => {
-            eprintln!("[!] Failed to load proxies.json: {}", e);
-            None
-        }
-    });
-
-pub fn select_upstream_proxy(cfg: &ClientConfig, session_store: &SessionStore) -> Option<String> {
+pub fn select_upstream_proxy(
+    cfg: &ClientConfig,
+    session_store: &SessionStore,
+    proxy_manager: &ProxyManager,
+) -> Option<String> {
     // Check session store first if sid exists
     if let Some(sid) = &cfg.sid {
         if let Some(cached_proxy) = session_store.get(sid) {
@@ -226,8 +219,7 @@ pub fn select_upstream_proxy(cfg: &ClientConfig, session_store: &SessionStore) -
     }
 
     // No cached session, select new proxy
-    let manager = PROXY_MANAGER.as_ref().cloned().unwrap();
-    let proxy = manager.select_proxy(&cfg)?;
+    let proxy = proxy_manager.select_proxy(&cfg)?;
 
     // Store in session if ttl provided
     if let Some(ref sid) = cfg.sid {
@@ -578,6 +570,7 @@ pub async fn handle(
     remote_addr: std::net::SocketAddr,
     session_store: Arc<SessionStore>,
     user_store: Arc<UserStore>,
+    proxy_manager: Arc<ProxyManager>,
 ) -> Result<Response<Body>, Infallible> {
     // Step 1: Extract credentials first
     let creds =
@@ -603,8 +596,8 @@ pub async fn handle(
 
     // Get proxy and target info
     let target = req.uri().to_string();
-    let proxy_url =
-        select_upstream_proxy(&cfg, &session_store).unwrap_or_else(|| "direct".to_string());
+    let proxy_url = select_upstream_proxy(&cfg, &session_store, &proxy_manager)
+        .unwrap_or_else(|| "direct".to_string());
 
     log_request(source_ip, &username, &proxy_url, &target);
     // Step 3: Forward request

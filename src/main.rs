@@ -1,6 +1,6 @@
 use hyper::service::{make_service_fn, service_fn};
 use hyper::Server;
-use shaheen_proxy::{SessionStore, UserStore};
+use shaheen_proxy::{ProxyManager, SessionStore, UserStore};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -17,6 +17,12 @@ async fn main() {
     let session_store = Arc::new(SessionStore::new());
     let user_store = Arc::new(UserStore::new());
 
+    // Load proxy manager - fail fast if config is missing or invalid
+    let proxy_manager = Arc::new(
+        ProxyManager::new("proxies.json")
+            .expect("Failed to load proxies.json - ensure file exists and is valid JSON"),
+    );
+
     // Add default test user for testing purposes (TODO: should be removed in production)
     user_store.add_user("test".to_string(), "test".to_string(), true);
 
@@ -28,14 +34,23 @@ async fn main() {
         let semaphore = semaphore.clone();
         let session_store = session_store.clone();
         let user_store = user_store.clone();
+        let proxy_manager = proxy_manager.clone();
         async move {
             Ok::<_, Infallible>(service_fn(move |req| {
                 let semaphore = semaphore.clone();
                 let session_store = session_store.clone();
                 let user_store = user_store.clone();
+                let proxy_manager = proxy_manager.clone();
                 async move {
                     let _permit = semaphore.acquire().await; // This queues when limit reached
-                    shaheen_proxy::handle(req, remote_addr, session_store, user_store).await
+                    shaheen_proxy::handle(
+                        req,
+                        remote_addr,
+                        session_store,
+                        user_store,
+                        proxy_manager,
+                    )
+                    .await
                 }
             }))
         }

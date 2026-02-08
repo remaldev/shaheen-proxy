@@ -126,8 +126,6 @@ impl ProxyManager {
             final_settings = settings;
         }
 
-        // print new client config for debugging
-        println!("Selected proxy: {:#?}", final_settings);
         let (protocol, username, password, host, port) = parse_url(&proxy.url)?;
         println!(
             "Parsed proxy URL - protocol: {}, username: {}, password: {}, host: {}, port: {}",

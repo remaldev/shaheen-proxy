@@ -427,34 +427,16 @@ async fn forward_http_request(
 
         // Send request
         match req_builder.send().await {
-            Ok(resp) if resp.status().is_success() => {
-                eprintln!(
-                    "[SUCCESS] HTTP request via {} (after {} attempts)",
-                    proxy_url, attempt
-                );
-                // Forward response to client
-                let status = resp.status();
-                let resp_headers = resp.headers().clone();
-                let resp_body = resp.bytes().await.unwrap();
-
-                let mut response = Response::builder().status(status.as_u16());
-                for (name, value) in resp_headers.iter() {
-                    response = response.header(name.as_str(), value.as_bytes());
-                }
-
-                return Ok(response.body(Body::from(resp_body.to_vec())).unwrap());
-            }
-            Ok(resp) if resp.status().is_server_error() => {
-                eprintln!(
-                    "[RETRY] HTTP request failed with {} - trying next proxy",
-                    resp.status()
-                );
-                failed_proxies.push(base_url);
-                continue;
-            }
             Ok(resp) => {
-                // Client error - return immediately (don't retry)
-                eprintln!("[CLIENT ERROR] {} - not retrying", resp.status());
+                // Any response from target (including 5xx) means proxy connection succeeded
+                // Return immediately - don't retry on target errors
+                eprintln!(
+                    "[SUCCESS] Got response via {} (status: {}, after {} attempts)",
+                    proxy_url,
+                    resp.status(),
+                    attempt
+                );
+
                 let status = resp.status();
                 let resp_headers = resp.headers().clone();
                 let resp_body = resp.bytes().await.unwrap();
@@ -467,7 +449,8 @@ async fn forward_http_request(
                 return Ok(response.body(Body::from(resp_body.to_vec())).unwrap());
             }
             Err(e) => {
-                eprintln!("[RETRY] Connection error: {} - trying next proxy", e);
+                // Connection error to PROXY - retry with different proxy
+                eprintln!("[RETRY] Proxy connection error: {} - trying next proxy", e);
                 intercept_connection_error(&e.to_string());
                 failed_proxies.push(base_url);
                 continue;

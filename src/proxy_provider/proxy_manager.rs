@@ -33,10 +33,20 @@ impl ProxyManager {
         })
     }
 
-    pub fn select_proxy(&self, settings: &ClientConfig) -> Option<String> {
+    pub fn select_proxy(
+        &self,
+        settings: &ClientConfig,
+        exclude_urls: &[String],
+    ) -> Option<(String, String)> {
+        // Returns: (generated_proxy_url, base_proxy_url_for_exclusion)
         // TODO: support random host id even when no session id requested (for proxies with hosts_per_country)
         // Filter proxies based on settings
         let mut filtered: Vec<&Account> = self.proxies.iter().collect();
+
+        // Filter out excluded proxy base URLs
+        if !exclude_urls.is_empty() {
+            filtered.retain(|p| !exclude_urls.contains(&p.url));
+        }
 
         // Filter by session support if session ID requested
         if settings.sid.is_some() {
@@ -169,6 +179,6 @@ impl ProxyManager {
 
         base_url = base_url.replace("{opts}", &opts);
         println!(">>> {}", base_url);
-        Some(base_url)
+        Some((base_url, proxy.url.clone()))
     }
 }

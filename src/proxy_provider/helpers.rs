@@ -46,7 +46,11 @@ pub fn parse_proxy_url(url_str: &str) -> Option<(String, String, String, String,
 ///
 /// # Returns
 /// `Option<bool>` indicating processing success or failure.
-pub fn replace_template_placeholder(opt: &Value, settings: &ClientConfig, opts: &mut String) -> Option<bool> {
+pub fn replace_template_placeholder(
+    opt: &Value,
+    settings: &ClientConfig,
+    opts: &mut String,
+) -> Option<bool> {
     let s = opt.as_str()?;
     // Case 1: it's a template like "-{sessionId}"
     if let (Some(start), Some(end)) = (s.find('{'), s.find('}')) {

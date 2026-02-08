@@ -14,20 +14,25 @@ use std::io::Write;
 use std::sync::Arc;
 
 /// Select upstream proxy from ProxyManager with session support
+/// Returns (generated_proxy_url, base_proxy_url_for_exclusion)
 pub fn select_internal_proxy(
     cfg: &ClientConfig,
     session_store: &SessionStore,
     proxy_manager: &ProxyManager,
-) -> Option<String> {
-    // Check session store first if sid exists
-    if let Some(sid) = &cfg.sid {
-        if let Some(cached_proxy) = session_store.get(sid) {
-            return Some(cached_proxy);
+    exclude_urls: &[String],
+) -> Option<(String, String)> {
+    // Check session store first if sid exists (only on first attempt)
+    if exclude_urls.is_empty() {
+        if let Some(sid) = &cfg.sid {
+            if let Some(cached_proxy) = session_store.get(sid) {
+                // For cached session, we don't have base_url, but it's OK since we won't retry
+                return Some((cached_proxy.clone(), cached_proxy));
+            }
         }
     }
 
     // No cached session, select new proxy
-    let proxy = proxy_manager.select_proxy(&cfg)?;
+    let (proxy, base_url) = proxy_manager.select_proxy(&cfg, exclude_urls)?;
 
     // Store in session if ttl provided
     if let Some(ref sid) = cfg.sid {
@@ -36,7 +41,7 @@ pub fn select_internal_proxy(
         }
     }
 
-    Some(proxy)
+    Some((proxy, base_url))
 }
 
 /// Parse upstream proxy URL into UpstreamEnum
@@ -113,6 +118,61 @@ fn intercept_connection_error(error_msg: &str) {
         eprintln!("[ANALYSIS] Error type: Connection refused/unreachable");
     } else {
         eprintln!("[ANALYSIS] Error type: Generic connection error");
+    }
+}
+
+/// Establish connection with retry logic - tries all available proxies until success
+async fn connect_with_retry(
+    cfg: &ClientConfig,
+    target: &str,
+    session_store: &SessionStore,
+    proxy_manager: &ProxyManager,
+) -> Result<(tokio::net::TcpStream, String), Response<Body>> {
+    let mut failed_proxies = Vec::new();
+    let mut attempt = 0;
+
+    loop {
+        attempt += 1;
+
+        // Select proxy (excludes previously failed base URLs)
+        let (proxy_url, base_url) =
+            match select_internal_proxy(cfg, session_store, proxy_manager, &failed_proxies) {
+                Some((url, base)) => (url, base),
+                None => {
+                    let msg = if attempt == 1 {
+                        "No proxy available"
+                    } else {
+                        "All proxies failed"
+                    };
+                    eprintln!("[ERROR] {} (tried {} proxies)", msg, failed_proxies.len());
+                    return Err(Response::builder()
+                        .status(StatusCode::BAD_GATEWAY)
+                        .body(Body::from(msg))
+                        .unwrap());
+                }
+            };
+
+        eprintln!("[CONNECT] Attempt {} using proxy: {}", attempt, proxy_url);
+
+        // Try to connect
+        match connect_via_upstream_proxy(&proxy_url, target).await {
+            Ok(stream) => {
+                eprintln!(
+                    "[SUCCESS] Connected via {} (after {} attempts)",
+                    proxy_url, attempt
+                );
+                return Ok((stream, proxy_url));
+            }
+            Err(e) => {
+                eprintln!(
+                    "[RETRY] Connection failed: {} - trying next proxy",
+                    e.status()
+                );
+                // Add base URL to exclusion list
+                failed_proxies.push(base_url);
+                continue;
+            }
+        }
     }
 }
 
@@ -236,18 +296,22 @@ async fn connect_via_upstream_proxy(
     }
 }
 
-/// Open bidirectional tunnel for CONNECT requests
+/// Open bidirectional tunnel for CONNECT requests with retry
 async fn open_bidirectional_tunnel(
     req: Request<Body>,
-    proxy_url: String,
+    cfg: &ClientConfig,
+    target: String,
+    session_store: Arc<SessionStore>,
+    proxy_manager: Arc<ProxyManager>,
 ) -> Result<Response<Body>, Infallible> {
-    let target = req.uri().authority().unwrap().as_str().to_string();
+    // Try to establish connection with retry
+    let (mut upstream, proxy_url) =
+        match connect_with_retry(cfg, &target, &session_store, &proxy_manager).await {
+            Ok(result) => result,
+            Err(error_response) => return Ok(error_response),
+        };
 
-    // Establish upstream connection (handles all proxy types)
-    let mut upstream = match connect_via_upstream_proxy(&proxy_url, &target).await {
-        Ok(stream) => stream,
-        Err(error_response) => return Ok(error_response),
-    };
+    eprintln!("[TUNNEL] Opened for {} via {}", target, proxy_url);
 
     // Spawn bidirectional tunnel
     tokio::spawn(async move {
@@ -310,54 +374,106 @@ fn build_upstream_client(upstream: UpstreamEnum) -> reqwest::Client {
     }
 }
 
-/// Forward HTTP (non-CONNECT) requests to upstream
+/// Forward HTTP (non-CONNECT) requests to upstream with retry until all proxies exhausted
 async fn forward_http_request(
     req: Request<Body>,
-    proxy_url: String,
+    cfg: &ClientConfig,
+    session_store: Arc<SessionStore>,
+    proxy_manager: Arc<ProxyManager>,
 ) -> Result<Response<Body>, Infallible> {
-    let upstream = parse_internal_proxy_config(&proxy_url);
+    let mut failed_proxies = Vec::new();
+    let mut attempt = 0;
+
     let uri = req.uri().to_string();
     let method = req.method().clone();
     let headers = req.headers().clone();
     let body = hyper::body::to_bytes(req.into_body()).await.unwrap();
 
-    // Build configured client
-    let client = build_upstream_client(upstream);
+    loop {
+        attempt += 1;
 
-    // Build outgoing request
-    let mut req_builder = client.request(method, &uri);
-    for (name, value) in headers.iter() {
-        let name_str = name.as_str();
-        if !name_str.starts_with("proxy-") && name_str != "connection" {
-            req_builder = req_builder.header(name_str, value.as_bytes());
+        // Select proxy (excludes previously failed base URLs)
+        let (proxy_url, base_url) =
+            match select_internal_proxy(cfg, &session_store, &proxy_manager, &failed_proxies) {
+                Some((url, base)) => (url, base),
+                None => {
+                    let msg = if attempt == 1 {
+                        "No proxy available"
+                    } else {
+                        "All proxies failed"
+                    };
+                    eprintln!("[ERROR] {} (tried {} proxies)", msg, failed_proxies.len());
+                    return Ok(Response::builder()
+                        .status(StatusCode::BAD_GATEWAY)
+                        .body(Body::from(msg))
+                        .unwrap());
+                }
+            };
+
+        eprintln!("[HTTP] Attempt {} using proxy: {}", attempt, proxy_url);
+
+        let upstream = parse_internal_proxy_config(&proxy_url);
+        let client = build_upstream_client(upstream);
+
+        // Build outgoing request
+        let mut req_builder = client.request(method.clone(), &uri);
+        for (name, value) in headers.iter() {
+            let name_str = name.as_str();
+            if !name_str.starts_with("proxy-") && name_str != "connection" {
+                req_builder = req_builder.header(name_str, value.as_bytes());
+            }
+        }
+        req_builder = req_builder.body(body.to_vec());
+
+        // Send request
+        match req_builder.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                eprintln!(
+                    "[SUCCESS] HTTP request via {} (after {} attempts)",
+                    proxy_url, attempt
+                );
+                // Forward response to client
+                let status = resp.status();
+                let resp_headers = resp.headers().clone();
+                let resp_body = resp.bytes().await.unwrap();
+
+                let mut response = Response::builder().status(status.as_u16());
+                for (name, value) in resp_headers.iter() {
+                    response = response.header(name.as_str(), value.as_bytes());
+                }
+
+                return Ok(response.body(Body::from(resp_body.to_vec())).unwrap());
+            }
+            Ok(resp) if resp.status().is_server_error() => {
+                eprintln!(
+                    "[RETRY] HTTP request failed with {} - trying next proxy",
+                    resp.status()
+                );
+                failed_proxies.push(base_url);
+                continue;
+            }
+            Ok(resp) => {
+                // Client error - return immediately (don't retry)
+                eprintln!("[CLIENT ERROR] {} - not retrying", resp.status());
+                let status = resp.status();
+                let resp_headers = resp.headers().clone();
+                let resp_body = resp.bytes().await.unwrap();
+
+                let mut response = Response::builder().status(status.as_u16());
+                for (name, value) in resp_headers.iter() {
+                    response = response.header(name.as_str(), value.as_bytes());
+                }
+
+                return Ok(response.body(Body::from(resp_body.to_vec())).unwrap());
+            }
+            Err(e) => {
+                eprintln!("[RETRY] Connection error: {} - trying next proxy", e);
+                intercept_connection_error(&e.to_string());
+                failed_proxies.push(base_url);
+                continue;
+            }
         }
     }
-    req_builder = req_builder.body(body.to_vec());
-
-    // Send request with error interception
-    let resp = match req_builder.send().await {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("[HTTP REQUEST ERROR] {}", e);
-            intercept_connection_error(&e.to_string());
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(Body::from(format!("Request failed: {}", e)))
-                .unwrap());
-        }
-    };
-
-    // Forward response to client
-    let status = resp.status();
-    let resp_headers = resp.headers().clone();
-    let resp_body = resp.bytes().await.unwrap();
-
-    let mut response = Response::builder().status(status.as_u16());
-    for (name, value) in resp_headers.iter() {
-        response = response.header(name.as_str(), value.as_bytes());
-    }
-
-    Ok(response.body(Body::from(resp_body.to_vec())).unwrap())
 }
 
 /// Log proxy request to file
@@ -405,19 +521,19 @@ pub async fn route_client_request(
         .headers()
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or(&remote_ip);
+        .unwrap_or(&remote_ip)
+        .to_string();
 
-    // Get proxy and target info
+    // Extract request info
     let target = req.uri().to_string();
-    let proxy_url = select_internal_proxy(&cfg, &session_store, &proxy_manager)
-        .unwrap_or_else(|| "direct".to_string());
+    let is_connect = req.method() == hyper::Method::CONNECT;
 
-    log_proxy_request(source_ip, &username, &proxy_url, &target);
+    log_proxy_request(&source_ip, &username, "[auto-select]", &target);
 
-    // Step 3: Forward request
-    if req.method() == hyper::Method::CONNECT {
-        open_bidirectional_tunnel(req, proxy_url).await
+    // Forward request with automatic retry
+    if is_connect {
+        open_bidirectional_tunnel(req, &cfg, target, session_store, proxy_manager).await
     } else {
-        forward_http_request(req, proxy_url).await
+        forward_http_request(req, &cfg, session_store, proxy_manager).await
     }
 }

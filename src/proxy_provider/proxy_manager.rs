@@ -1,4 +1,4 @@
-use super::helpers::{parse_url, process_word};
+use super::helpers::{parse_proxy_url, replace_template_placeholder};
 use super::ProxiesConfig;
 use crate::{proxy_provider::Account, ClientConfig};
 use rand::seq::SliceRandom;
@@ -126,7 +126,7 @@ impl ProxyManager {
             final_settings = settings;
         }
 
-        let (protocol, username, password, host, port) = parse_url(&proxy.url)?;
+        let (protocol, username, password, host, port) = parse_proxy_url(&proxy.url)?;
         println!(
             "Parsed proxy URL - protocol: {}, username: {}, password: {}, host: {}, port: {}",
             protocol, username, password, host, port
@@ -158,7 +158,9 @@ impl ProxyManager {
         for opt in &template.opts {
             if let Some(arr) = opt.as_array() {
                 for word in arr {
-                    if let Some(true) = process_word(word, final_settings, &mut opts) {
+                    if let Some(true) =
+                        replace_template_placeholder(word, final_settings, &mut opts)
+                    {
                         break;
                     }
                 }

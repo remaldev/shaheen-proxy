@@ -154,7 +154,7 @@ pub fn validate_user_credentials(
         return None;
     }
 
-    if user_store.validate(&base_user, password) {
+    if user_store.validate_credentials(&base_user, password) {
         return Some(cfg);
     }
 
@@ -195,7 +195,7 @@ pub fn parse_proxy_auth(req: &Request<Body>, user_store: &UserStore) -> Option<C
 }
 
 /// Build 407 authentication required response
-pub(crate) fn auth_required_response() -> Response<Body> {
+pub(crate) fn build_auth_required_response() -> Response<Body> {
     Response::builder()
         .status(StatusCode::PROXY_AUTHENTICATION_REQUIRED)
         .header("Proxy-Authenticate", r#"Basic realm="shaheen-proxy""#)

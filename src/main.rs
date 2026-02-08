@@ -43,7 +43,7 @@ async fn main() {
                 let proxy_manager = proxy_manager.clone();
                 async move {
                     let _permit = semaphore.acquire().await; // This queues when limit reached
-                    shaheen_proxy::handle(
+                    shaheen_proxy::route_client_request(
                         req,
                         remote_addr,
                         session_store,

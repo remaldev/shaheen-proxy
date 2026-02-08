@@ -25,7 +25,7 @@ impl UserStore {
         self.users.get(username).map(|u| u.clone())
     }
 
-    pub fn validate(&self, username: &str, password: &str) -> bool {
+    pub fn validate_credentials(&self, username: &str, password: &str) -> bool {
         if let Some(user) = self.get_user(username) {
             return user.active && user.password == password;
         }

@@ -12,4 +12,4 @@ pub use crate::user_store::UserStore;
 
 // Re-export public API functions
 pub use crate::auth::{parse_proxy_auth, parse_username, validate_user_credentials};
-pub use crate::handler::{handle, select_upstream_proxy};
+pub use crate::handler::{route_client_request, select_internal_proxy};

@@ -8,7 +8,7 @@ use serde_json::Value;
 ///
 /// # Returns
 /// An `Option` containing a tuple of (protocol, username, password, host, port)
-pub fn parse_url(url_str: &str) -> Option<(String, String, String, String, u16)> {
+pub fn parse_proxy_url(url_str: &str) -> Option<(String, String, String, String, u16)> {
     let url = url::Url::parse(url_str).ok()?;
 
     let protocol = url.scheme().to_string();
@@ -46,7 +46,7 @@ pub fn parse_url(url_str: &str) -> Option<(String, String, String, String, u16)>
 ///
 /// # Returns
 /// `Option<bool>` indicating processing success or failure.
-pub fn process_word(opt: &Value, settings: &ClientConfig, opts: &mut String) -> Option<bool> {
+pub fn replace_template_placeholder(opt: &Value, settings: &ClientConfig, opts: &mut String) -> Option<bool> {
     let s = opt.as_str()?;
     // Case 1: it's a template like "-{sessionId}"
     if let (Some(start), Some(end)) = (s.find('{'), s.find('}')) {

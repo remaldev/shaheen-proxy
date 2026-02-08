@@ -1,5 +1,5 @@
 use crate::auth::{
-    auth_required_response, extract_credentials_from_header, extract_credentials_from_uri,
+    build_auth_required_response, extract_credentials_from_header, extract_credentials_from_uri,
     validate_user_credentials,
 };
 use crate::proxy_provider::{ClientConfig, UpstreamEnum};
@@ -14,7 +14,7 @@ use std::io::Write;
 use std::sync::Arc;
 
 /// Select upstream proxy from ProxyManager with session support
-pub fn select_upstream_proxy(
+pub fn select_internal_proxy(
     cfg: &ClientConfig,
     session_store: &SessionStore,
     proxy_manager: &ProxyManager,
@@ -40,7 +40,7 @@ pub fn select_upstream_proxy(
 }
 
 /// Parse upstream proxy URL into UpstreamEnum
-fn parse_upstream(proxy: &str) -> UpstreamEnum {
+fn parse_internal_proxy_config(proxy: &str) -> UpstreamEnum {
     if proxy == "direct" {
         return UpstreamEnum::Direct;
     }
@@ -118,11 +118,11 @@ fn intercept_connection_error(error_msg: &str) {
 
 /// Establish connection through upstream proxy
 /// Returns TcpStream on success, or Response with error for client
-async fn connect_through_upstream(
+async fn connect_via_upstream_proxy(
     proxy_url: &str,
     target: &str,
 ) -> Result<tokio::net::TcpStream, Response<Body>> {
-    let upstream_result = match parse_upstream(proxy_url) {
+    let upstream_result = match parse_internal_proxy_config(proxy_url) {
         UpstreamEnum::Direct => tokio::net::TcpStream::connect(target).await,
 
         UpstreamEnum::Socks5 {
@@ -236,15 +236,15 @@ async fn connect_through_upstream(
     }
 }
 
-/// Handle CONNECT tunnel requests
-async fn handle_connect_tunnel(
+/// Open bidirectional tunnel for CONNECT requests
+async fn open_bidirectional_tunnel(
     req: Request<Body>,
     proxy_url: String,
 ) -> Result<Response<Body>, Infallible> {
     let target = req.uri().authority().unwrap().as_str().to_string();
 
     // Establish upstream connection (handles all proxy types)
-    let mut upstream = match connect_through_upstream(&proxy_url, &target).await {
+    let mut upstream = match connect_via_upstream_proxy(&proxy_url, &target).await {
         Ok(stream) => stream,
         Err(error_response) => return Ok(error_response),
     };
@@ -266,7 +266,7 @@ async fn handle_connect_tunnel(
 }
 
 /// Build reqwest client configured for the upstream proxy
-fn build_reqwest_client(upstream: UpstreamEnum) -> reqwest::Client {
+fn build_upstream_client(upstream: UpstreamEnum) -> reqwest::Client {
     match upstream {
         UpstreamEnum::Direct => reqwest::Client::builder().build().unwrap(),
 
@@ -310,19 +310,19 @@ fn build_reqwest_client(upstream: UpstreamEnum) -> reqwest::Client {
     }
 }
 
-/// Handle HTTP (non-CONNECT) requests
-async fn handle_http_request(
+/// Forward HTTP (non-CONNECT) requests to upstream
+async fn forward_http_request(
     req: Request<Body>,
     proxy_url: String,
 ) -> Result<Response<Body>, Infallible> {
-    let upstream = parse_upstream(&proxy_url);
+    let upstream = parse_internal_proxy_config(&proxy_url);
     let uri = req.uri().to_string();
     let method = req.method().clone();
     let headers = req.headers().clone();
     let body = hyper::body::to_bytes(req.into_body()).await.unwrap();
 
     // Build configured client
-    let client = build_reqwest_client(upstream);
+    let client = build_upstream_client(upstream);
 
     // Build outgoing request
     let mut req_builder = client.request(method, &uri);
@@ -361,7 +361,7 @@ async fn handle_http_request(
 }
 
 /// Log proxy request to file
-fn log_request(source_ip: &str, username: &str, proxy: &str, target: &str) {
+fn log_proxy_request(source_ip: &str, username: &str, proxy: &str, target: &str) {
     let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
     let log_line = format!(
         "{} | {} | {} | {} | {}\n",
@@ -377,8 +377,8 @@ fn log_request(source_ip: &str, username: &str, proxy: &str, target: &str) {
     }
 }
 
-/// Main HTTP request handler
-pub async fn handle(
+/// Route client requests to appropriate handler
+pub async fn route_client_request(
     req: Request<Body>,
     remote_addr: std::net::SocketAddr,
     session_store: Arc<SessionStore>,
@@ -390,13 +390,13 @@ pub async fn handle(
         extract_credentials_from_header(&req).or_else(|| extract_credentials_from_uri(&req));
     let (username, password) = match creds {
         Some(c) => c,
-        None => return Ok(auth_required_response()),
+        None => return Ok(build_auth_required_response()),
     };
 
     // Step 2: Validate auth
     let cfg = match validate_user_credentials(&username, &password, &user_store) {
         Some(c) => c,
-        None => return Ok(auth_required_response()),
+        None => return Ok(build_auth_required_response()),
     };
 
     // Get source IP (prefer x-forwarded-for if behind proxy, otherwise use direct connection IP)
@@ -409,15 +409,15 @@ pub async fn handle(
 
     // Get proxy and target info
     let target = req.uri().to_string();
-    let proxy_url = select_upstream_proxy(&cfg, &session_store, &proxy_manager)
+    let proxy_url = select_internal_proxy(&cfg, &session_store, &proxy_manager)
         .unwrap_or_else(|| "direct".to_string());
 
-    log_request(source_ip, &username, &proxy_url, &target);
+    log_proxy_request(source_ip, &username, &proxy_url, &target);
 
     // Step 3: Forward request
     if req.method() == hyper::Method::CONNECT {
-        handle_connect_tunnel(req, proxy_url).await
+        open_bidirectional_tunnel(req, proxy_url).await
     } else {
-        handle_http_request(req, proxy_url).await
+        forward_http_request(req, proxy_url).await
     }
 }
